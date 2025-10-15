@@ -409,16 +409,37 @@ st.caption("Zaman ufku seç, ısı haritasını gör, bir bölgeye tıkla → po
 
 with st.sidebar:
     st.header("Zaman & Filtreler")
-    horizon = st.radio("Ufuk", ["24 saat (saatlik)","72 saat (3s blok)","1 hafta (günlük)"])
+
+    now = datetime.now()
+    now_str = now.strftime("%Y-%m-%d %H:%M")
+
+    horizon = st.radio(
+        f"Ufuk (şimdi: {now_str})",
+        ["Anlık (şimdi)", "24 saat (saatlik)", "72 saat (3s blok)", "1 hafta (günlük)"],
+        index=0,
+    )
+
     today = date.today()
     base_date = st.date_input("Tarih", value=today)
-    if "24 saat" in horizon:
-        hour_sel = st.slider("Saat", 0, 23, 18)
+
+    # Kontrolleri ufka göre göster
+    if horizon == "Anlık (şimdi)":
+        st.caption(f"Seçilen: {now.strftime('%Y-%m-%d %H:00')}")
+        hour_sel = now.hour  # kullanılacak
+    elif "24 saat" in horizon:
+        hour_sel = st.slider("Saat", 0, 23, now.hour)
     elif "72 saat" in horizon:
-        start_hour = st.slider("Başlangıç saati (72h)", 0, 23, 0)
-        bin_index = st.selectbox("Gösterilecek 3s blok", list(range(8)), index=6, format_func=lambda i: f"{i*3:02d}-{i*3+2:02d}")
+        start_hour = st.slider("Başlangıç saati (72h)", 0, 23, now.hour)
+        bin_index = st.selectbox(
+            "Gösterilecek 3s blok (0..23)",
+            list(range(24)),
+            index=min(23, (now.hour // 3)),  # mantıklı varsayılan
+            format_func=lambda i: f"{i*3:02d}-{i*3+2:02d}",
+        )
     else:
+        # 1 hafta
         day_index = st.selectbox("Gösterilecek gün (0..6)", list(range(7)), index=0)
+
     refresh = st.button("Veriyi Yenile")
 
     st.divider()
