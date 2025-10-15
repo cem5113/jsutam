@@ -1,5 +1,7 @@
-streamlit==1.38.0
-pandas==2.2.3
-pydeck==0.9.1
-requests==2.32.3
-pyarrow==17.0.0  
+streamlit>=1.37
+pandas>=2.2
+requests>=2.31
+pydeck>=0.8
+folium>=0.16.0
+streamlit-folium>=0.21.0
+branca>=0.7.2
