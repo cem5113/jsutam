@@ -485,9 +485,10 @@ if clicked_geoid:
         total_e = sel["pred_expected"].sum()
         pr = sel["priority"].iloc[0]
         mean_p = sel["risk_score"].mean()
-        # top-3
+
+        # top-3 verisini çek
         t3 = top3[top3["geoid"] == clicked_geoid]["top3"]
-        t3_list = (t3.iloc[0] if len(t3
+        raw_t3 = t3.iloc[0] if len(t3) > 0 else None
 
         # top-3'u güvenli biçimde çöz
         def _parse_top3(x):
@@ -496,7 +497,6 @@ if clicked_geoid:
                 return []
             # zaten liste/tuple ise
             if isinstance(x, (list, tuple)):
-                # liste içeriği "label,score" tuple'ları mı?
                 out = []
                 for it in x:
                     if isinstance(it, (list, tuple)) and len(it) >= 2:
@@ -505,7 +505,7 @@ if clicked_geoid:
                         # yalnızca isim ise skoru None kabul et
                         out.append((str(it), None))
                 return out[:3]
-            # metin ise: json dene
+            # metin ise: JSON dene
             s = str(x).strip()
             if not s:
                 return []
@@ -530,12 +530,9 @@ if clicked_geoid:
             # yalnızca virgüllü isim listesi
             return [(tok.strip(), None) for tok in s.split(",")[:3]]
 
-        t3_list = []
-        if not t3.empty:
-            raw = t3.iloc[0]
-            t3_list = _parse_top3(raw)
+        t3_list = _parse_top3(raw_t3)
 
-        # ufuk etiketi (yoksa yedeğe düş)
+        # Ufuk etiketi
         horizon_label = locals().get("UFUK_LABEL") or locals().get("horizon_label") or "Seçili Dilim"
 
         # ---- Sonuç Kartı ----
@@ -568,4 +565,3 @@ if clicked_geoid:
             st.metric(label="Mean p", value=f"{mean_p:.3f}")
 
         st.divider()
-
