@@ -273,6 +273,17 @@ def attach_pred_expected(df: pd.DataFrame) -> pd.DataFrame:
     # sonuç
     m["pred_expected"] = (pd.to_numeric(m["risk_score"], errors="coerce").fillna(0.0) *
                           pd.to_numeric(m["exposure_guess"], errors="coerce").fillna(0.3)).round(3)
+
+    if "day_of_week" not in c9.columns and "dow" in c9.columns:
+        c9 = c9.rename(columns={"dow": "day_of_week"})
+    if "event_hour" not in c9.columns and "hour_range" in c9.columns:
+        c9["event_hour"] = pd.to_numeric(c9["hour_range"], errors="coerce").fillna(0).astype(int)
+    
+    need_cols = {"geoid","season","day_of_week","event_hour","exposure_guess"}
+    missing = need_cols - set(c9.columns)
+    if missing:
+        st.warning(f"sf_crime_09 eksik kolon(lar): {', '.join(sorted(missing))}")
+        
     return m
     
 # -------------------------
@@ -334,6 +345,15 @@ try:
         fetch_geojson_smart.clear()
         load_exposure_fallback.clear()
     base_df = read_risk_from_artifact()
+
+    with st.expander("🔎 Teşhis (geçici)"):
+        st.write("risk_hourly:", base_df.shape, list(base_df.columns))
+        try:
+            c9_dbg = pd.read_csv(RAW_C09, nrows=5)
+            st.write("sf_crime_09 (örnek 5 satır):", c9_dbg.shape, list(c9_dbg.columns))
+        except Exception as e:
+            st.write("sf_crime_09 okunamadı:", e)
+            
 except Exception as e:
     st.error(f"Artifact indirilemedi/okunamadı: {e}")
     st.stop()
@@ -342,9 +362,27 @@ except Exception as e:
 df = attach_pred_expected(base_df)
 
 # filtre kontrolleri
+# --- FİLTRELERİ VERİYE GÖRE AYARLA ---
+hours_avail   = sorted(pd.to_numeric(df.get("hour", pd.Series([], dtype=int)), errors="coerce").dropna().astype(int).unique().tolist())
+dows_avail    = sorted(pd.to_numeric(df.get("dow",  pd.Series([], dtype=int)), errors="coerce").dropna().astype(int).unique().tolist())
+seasons_avail = sorted(df.get("season", pd.Series([], dtype=str)).astype(str).dropna().unique().tolist())
+
 with st.sidebar:
-    hour = st.slider("Saat", 0, 23, 0)
-    dow  = st.selectbox("Haftanın Günü (0=Mon … 6=Sun)", list(range(7)), index=0)
+    hour  = st.selectbox("Saat", hours_avail or list(range(24)), index=0)
+    dow   = st.selectbox("Haftanın Günü (0=Mon … 6=Sun)", dows_avail or list(range(7)), index=0)
+
+    def _idx_default(seasons):
+        try:
+            mo = datetime.now().month
+            m2s = {12:"Winter",1:"Winter",2:"Winter",3:"Spring",4:"Spring",5:"Spring",
+                   6:"Summer",7:"Summer",8:"Summer",9:"Fall",10:"Fall",11:"Fall"}
+            return seasons.index(m2s[mo]) if m2s[mo] in seasons else 0
+        except Exception:
+            return 0
+    seasons = seasons_avail or ["All"]
+    season  = st.selectbox("Sezon", seasons, index=_idx_default(seasons))
+    topk    = st.slider("Top-K (kritik liste)", 10, 200, 50)
+
     # sezondaki seçenekleri veriden türet
     seasons = sorted(df["season"].astype(str).unique().tolist())
     def _idx_default():
@@ -383,6 +421,24 @@ geojson = fetch_geojson_smart(
     raw_owner=RAW_GEOJSON_OWNER,
     raw_repo=RAW_GEOJSON_REPO,
 )
+# --- GeoJSON yükleme/URL ---
+st.sidebar.divider()
+st.sidebar.write("Yedek GeoJSON kaynakları")
+geojson_url = st.sidebar.text_input("Doğrudan GeoJSON URL'si (raw)", value="")
+geojson_upload = st.sidebar.file_uploader("veya GeoJSON dosyası yükle (.geojson/.json)", type=["geojson","json"])
+
+if geojson_upload is not None:
+    try:
+        geojson = json.load(geojson_upload)
+    except Exception as e:
+        st.sidebar.error(f"Yüklenen GeoJSON okunamadı: {e}")
+elif geojson_url:
+    try:
+        r = requests.get(geojson_url, timeout=30)
+        r.raise_for_status()
+        geojson = r.json()
+    except Exception as e:
+        st.sidebar.error(f"URL'den GeoJSON alınamadı: {e}")
 
 # Harita
 st.subheader("Harita — Saatlik Risk (seçime göre)")
@@ -395,7 +451,10 @@ else:
     # Basit yol: GeoJSONLayer kullanırken tooltipteki alanları feature.properties'ten alamıyorsak
     # JS tarafında gösterilenleri sınırlı tutarız. Burada mapping yöntemi: py_dmap ile renk, tablo ile bilgi.
     # Pratikte popover için tabloyu alta veriyoruz.
-    make_map_forecast(geojson, sel[["geoid","risk_score","pred_expected"]])
+    if sel.empty:
+        st.info("Seçime göre satır bulunamadı. Filtreleri değiştirin (özellikle Saat/Sezon).")
+    else:
+        make_map_forecast(geojson, sel[["geoid","risk_score","pred_expected"]])
 
 # Top-K tablo
 st.subheader("Kritik Top-K (E[olay] yüksek)")
