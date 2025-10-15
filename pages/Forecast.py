@@ -1,8 +1,7 @@
 # pages/Forecast.py
-
+import io
+import requests
 import json
-from urllib.request import urlopen
-
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
@@ -28,25 +27,21 @@ def _norm_geoid(series: pd.Series) -> pd.Series:
 
 @st.cache_data(ttl=15 * 60)
 def load_risk() -> pd.DataFrame:
-    # GitHub RAW'dan parquet'ı indir → BytesIO ile oku
     r = requests.get(URL_RISK, timeout=30)
     r.raise_for_status()
-    df = pd.read_parquet(io.BytesIO(r.content))
+    df = pd.read_parquet(io.BytesIO(r.content))  # <— artık HTTPError yok
 
     # kolonları normalize et
     df.columns = [c.strip().lower() for c in df.columns]
 
-    # GEOID normalize
+    # GEOID normalize (11 hane)
     if "geoid" not in df.columns:
         for alt in ["cell_id", "geoid10", "geoid11", "geoid_10", "geoid_11", "id"]:
             if alt in df.columns:
                 df["geoid"] = df[alt]
                 break
     df["geoid"] = (
-        df["geoid"].astype(str)
-        .str.replace(r"\D", "", regex=True)
-        .str.zfill(11)
-        .str[:11]
+        df["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11).str[:11]
     )
 
     # proba/risk_score alias — 0/1 kolonlarını ele
@@ -65,21 +60,18 @@ def load_risk() -> pd.DataFrame:
         df["date"] = pd.to_datetime(df["date"]).dt.date
 
     return df
-
+    
 @st.cache_data(ttl=24 * 60 * 60)
 def load_geojson() -> dict:
     r = requests.get(URL_GEO, timeout=30)
     r.raise_for_status()
     gj = r.json()
     for ft in gj.get("features", []):
-        props = ft.get("properties", {})
-        val = props.get("GEOID", props.get("geoid", ""))
+        props = ft.get("properties", {}) or {}
+        geo_val = props.get("GEOID", props.get("geoid", ""))
         props["GEOID"] = (
-            str(val)
-            .replace("-", "")
-            .replace(" ", "")
+            str(geo_val).replace("-", "").replace(" ", "")
         )
-        props["GEOID"] = props["GEOID"].strip()
         props["GEOID"] = props["GEOID"][:11].rjust(11, "0")
         ft["properties"] = props
     return gj
