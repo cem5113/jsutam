@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# app.py — Suç Tahmini Uygulaması (dorecast & Forecast page uyumlu)
+
 import io, os, json, zipfile
 from datetime import date
 import pandas as pd
@@ -66,10 +69,9 @@ def read_risk_from_artifact() -> pd.DataFrame:
         with zf.open(matches[0]) as f:
             df = pd.read_parquet(f)
 
-    # kolon adlarını normalize et
     df.columns = [c.strip().lower() for c in df.columns]
 
-    # GEOID çıkar / normalize
+    # GEOID
     if "geoid" not in df.columns:
         for alt in ["cell_id", "geoid10", "geoid11", "geoid_10", "geoid_11", "id"]:
             if alt in df.columns:
@@ -77,17 +79,16 @@ def read_risk_from_artifact() -> pd.DataFrame:
                 break
     df["geoid"] = df["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
 
-    # tarih varsa
+    # tarih
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"]).dt.date
 
-    # risk kolonunu aliasla (artifact'a göre değişebilir: proba / risk_score / risk)
+    # risk alias
     if "risk_score" not in df.columns:
         if "proba" in df.columns:
             df = df.rename(columns={"proba": "risk_score"})
         elif "risk" in df.columns:
             df = df.rename(columns={"risk": "risk_score"})
-        # değilse zaten risk_score vardır veya üstte rename edildi
 
     return df
 
@@ -224,63 +225,6 @@ def make_map_home(geojson_enriched: dict):
     st.pydeck_chart(deck, use_container_width=True)
 
 # =========================
-# Forecast sekmesi yardımcıları
-# =========================
-@st.cache_data(ttl=30*60)
-def load_exposure_fallback():
-    """
-    risk_hourly.parquet içinde 'pred_expected' yoksa
-    saatlik exposure tahmini için sf_crime_09.csv'den üret.
-    Mantık: crime_last_7d / 7 ≈ saatlik taban (min 0.1).
-    """
-    try:
-        RAW = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/crime_prediction_data/sf_crime_09.csv"
-        c9 = pd.read_csv(RAW)
-        if "GEOID" not in c9.columns:
-            c9["GEOID"] = c9["GEOID"].astype(str).str.extract(r"(\d+)").fillna("").str[:11]
-        c9["GEOID"] = c9["GEOID"].astype(str).str.replace(r"\D","",regex=True).str.zfill(11)
-        c9["exposure_guess"] = (c9.get("crime_last_7d", 0) / 7.0).clip(lower=0.1)
-        keep = ["GEOID","hour_range","exposure_guess"]
-        return c9[[c for c in keep if c in c9.columns]]
-    except Exception:
-        return pd.DataFrame(columns=["GEOID","hour_range","exposure_guess"])
-
-def make_map_forecast(geojson: dict, df_layer: pd.DataFrame):
-    dmap = df_layer.set_index("geoid")["risk_score"].to_dict()
-    qs = df_layer["risk_score"].quantile([0,.25,.5,.75,1]).tolist()
-    layer = pdk.Layer(
-        "GeoJsonLayer", geojson, stroked=False, opacity=.7, pickable=True,
-        get_fill_color={
-            "function": """
-            const M=Object.fromEntries(py_dmap), Q=py_qs;
-            return (f)=>{
-              const g=String(f.properties.GEOID||f.properties.geoid||"").replace(/\\D/g,"").padStart(11,"0").slice(0,11);
-              const p=(M[g]===undefined)?0:M[g];
-              if (p<=Q[1]) return [178,223,138,220];
-              if (p<=Q[2]) return [255,255,178,220];
-              if (p<=Q[3]) return [254,204,92,230];
-              return [227,26,28,235];
-            }
-            """
-        },
-        parameters={"py_dmap": list(dmap.items()), "py_qs": qs},
-    )
-    tooltip = {
-        "html": (
-            "<b>GEOID:</b> {GEOID}<br/>"
-            "<b>Risk (p):</b> {risk_score}<br/>"
-            "<b>E[olay]:</b> {pred_expected}"
-        )
-    }
-    deck = pdk.Deck(
-        layers=[layer],
-        initial_view_state=pdk.ViewState(latitude=37.7749, longitude=-122.4194, zoom=10),
-        map_style="light",
-        tooltip=tooltip,
-    )
-    st.pydeck_chart(deck, use_container_width=True)
-
-# =========================
 # UI — Sekmeler
 # =========================
 st.title("🗺️ Suç Tahmini Uygulaması")
@@ -343,34 +287,26 @@ with tabs[0]:
     else:
         st.info("Artifact içinde tarih bulunamadı. Forecast sekmesinden saatlik görünüme bakabilirsiniz.")
 
-st.title("🗺️ Suç Tahmini Uygulaması")
-
-# Sadece 4 sekme: Home, Planning, Stats, Reports
-tabs = st.tabs(["Home", "Planning", "Stats", "Reports"])
-
-# ---------- Home ----------
-with tabs[0]:
-    st.subheader("Suç Risk Haritası — Günlük Ortalama")
-    # (Senin mevcut Home akışı burada aynen dursun)
-    # ...
-    st.info("Saatlik tahmin ve E[olay] için Forecast sayfasını kullanın.")
-    # Streamlit 1.35+ ise:
+# ---------- Forecast (sayfaya link) ----------
+with tabs[1]:
+    st.subheader("🧭 Forecast")
+    st.write("Saatlik/3s/günlük ufuk tahminleri için ayrı sayfayı açın:")
     try:
-        st.page_link("pages/Forecast.py", label="→ Forecast sayfasına git", icon="🧭")
+        st.page_link("pages/Forecast.py", label="Forecast sayfasını aç", icon="🧭")
     except Exception:
-        pass
+        st.info("Streamlit sürümünüz 'page_link' desteklemiyor olabilir. Lütfen sol menüden 'Forecast' sayfasını açın.")
 
 # ---------- Planning ----------
-with tabs[1]:
+with tabs[2]:
     st.subheader("🚓 Devriye Planlama (yakında)")
     st.info("Ekip sayısı / rota uzunluğu / dwell / çeşitlilik ayarı buraya taşınacak.")
 
 # ---------- Stats ----------
-with tabs[2]:
+with tabs[3]:
     st.subheader("📊 Suç İstatistikleri (yakında)")
     st.info("Saat-gün-ay dağılımları, ısı haritaları, tür dağılımı vs.")
 
 # ---------- Reports ----------
-with tabs[3]:
+with tabs[4]:
     st.subheader("🧾 Raporlar & Operasyonel Öneriler (yakında)")
     st.info("Günlük/Haftalık/Aylık rapor üretimi + PDF/CSV indirme burada.")
