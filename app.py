@@ -367,53 +367,83 @@ with tabs[1]:
     if "day_of_week" in layer_df.columns: layer_df = layer_df[layer_df["day_of_week"]==sel_dow]
     if "season" in layer_df.columns:      layer_df = layer_df[layer_df["season"]==sel_season]
 
-    # risk_score alias (garanti)
-    if "risk_score" not in layer_df.columns:
-        if "proba" in layer_df.columns:
-            layer_df["risk_score"] = layer_df["proba"].astype(float)
-        elif "risk" in layer_df.columns:
-            layer_df["risk_score"] = layer_df["risk"].astype(float)
-        else:
-            st.warning("risk_score/proba/risk kolonu bulunamadı.")
-            layer_df["risk_score"] = 0.0
+# --- risk_score alias (garanti)
+if "risk_score" not in layer_df.columns:
+    if "proba" in layer_df.columns:
+        layer_df["risk_score"] = layer_df["proba"].astype(float)
+    elif "risk" in layer_df.columns:
+        layer_df["risk_score"] = layer_df["risk"].astype(float)
+    else:
+        st.warning("risk_score/proba/risk kolonu bulunamadı.")
+        layer_df["risk_score"] = 0.0
 
-    # E[olay] = pred_expected (varsa) else proba × exposure_guess
-    if "pred_expected" not in layer_df.columns:
-        exp = load_exposure_fallback()
-        if not exp.empty and "hour_range" in layer_df.columns and "hour_range" in exp.columns:
-            layer_df = layer_df.merge(exp[["GEOID","hour_range","exposure_guess"]], on=["GEOID","hour_range"], how="left")
-        else:
-            exp_geo = exp.groupby("GEOID", as_index=False)["exposure_guess"].mean() if not exp.empty else pd.DataFrame(columns=["GEOID","exposure_guess"])
-            layer_df = layer_df.merge(exp_geo, on="GEOID", how="left")
-        layer_df["exposure_guess"] = layer_df["exposure_guess"].fillna(0.3)
-        layer_df["pred_expected"] = (layer_df["risk_score"] * layer_df["exposure_guess"]).round(2)
+# --- GEOID anahtarını tek tipe indir (lowercase 'geoid' + 11 hane)
+if "geoid" not in layer_df.columns:
+    for alt in ["GEOID", "cell_id", "geoid10", "geoid11", "geoid_10", "geoid_11", "id"]:
+        if alt in layer_df.columns:
+            layer_df["geoid"] = layer_df[alt]
+            break
+layer_df["geoid"] = (
+    layer_df["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
+)
 
-    # GeoJSON
-    geojson = fetch_geojson_smart(
-        path_local=GEOJSON_PATH_LOCAL_DEFAULT,
-        path_in_zip=GEOJSON_IN_ZIP_PATH_DEFAULT,
-        raw_owner=RAW_GEOJSON_OWNER,
-        raw_repo=RAW_GEOJSON_REPO,
+# --- E[olay] = pred_expected (varsa) ELSE risk_score × exposure_guess
+if "pred_expected" not in layer_df.columns:
+    exp = load_exposure_fallback()  # beklenen: GEOID/geoid, hour_range?, exposure_guess
+
+    # exposure tarafını da 'geoid' standardına çek
+    if not exp.empty:
+        if "GEOID" in exp.columns:
+            exp = exp.rename(columns={"GEOID": "geoid"})
+        exp["geoid"] = exp["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
+
+    if (not exp.empty) and ("hour_range" in layer_df.columns) and ("hour_range" in exp.columns):
+        layer_df = layer_df.merge(
+            exp[["geoid", "hour_range", "exposure_guess"]],
+            on=["geoid", "hour_range"], how="left"
+        )
+    else:
+        exp_geo = (
+            exp.groupby("geoid", as_index=False)["exposure_guess"].mean()
+            if not exp.empty else pd.DataFrame(columns=["geoid", "exposure_guess"])
+        )
+        layer_df = layer_df.merge(exp_geo, on="geoid", how="left")
+
+    layer_df["exposure_guess"] = layer_df["exposure_guess"].fillna(0.3)
+    layer_df["pred_expected"]  = (layer_df["risk_score"] * layer_df["exposure_guess"]).round(2)
+
+# --- GeoJSON
+geojson = fetch_geojson_smart(
+    path_local=GEOJSON_PATH_LOCAL_DEFAULT,
+    path_in_zip=GEOJSON_IN_ZIP_PATH_DEFAULT,
+    raw_owner=RAW_GEOJSON_OWNER,
+    raw_repo=RAW_GEOJSON_REPO,
+)
+
+# --- Harita + Top-K
+colL, colR = st.columns([3, 1], gap="large")
+with colL:
+    if geojson and not layer_df.empty:
+        # make_map_forecast 'geoid' bekliyor; tüm kolonları UPPER yapma
+        make_map_forecast(geojson, layer_df)
+    else:
+        st.info("GeoJSON veya katman verisi yok.")
+
+with colR:
+    st.markdown("**Kritik Top-K (E[olay])**")
+    topn = st.slider("Kayıt sayısı", 10, 200, 50)
+    cols_show = [c for c in ["geoid", "risk_score", "pred_expected"] if c in layer_df.columns]
+    top = (
+        layer_df[cols_show]
+        .sort_values(["pred_expected", "risk_score"], ascending=False)
+        .head(topn)
+        .reset_index(drop=True)
     )
-
-    # Harita + Top-K
-    colL, colR = st.columns([3,1], gap="large")
-    with colL:
-        if geojson and not layer_df.empty:
-            make_map_forecast(geojson, layer_df.rename(columns=str.upper))  # tooltip GEOID için
-        else:
-            st.info("GeoJSON veya katman verisi yok.")
-
-    with colR:
-        st.markdown("**Kritik Top-K (E[olay])**")
-        topn = st.slider("Kayıt sayısı", 10, 200, 50)
-        cols_show = [c for c in ["GEOID","risk_score","pred_expected"] if c in layer_df.columns]
-        top = layer_df[cols_show].sort_values(["pred_expected","risk_score"], ascending=False).head(topn)
-        st.dataframe(top.reset_index(drop=True), use_container_width=True)
-        if not layer_df.empty:
-            q25,q50,q75 = layer_df["risk_score"].quantile([.25,.5,.75]).round(4)
-            st.caption(f"Q25={q25:.4f} • Q50={q50:.4f} • Q75={q75:.4f}")
-
+    st.dataframe(top, use_container_width=True)
+    if not layer_df.empty:
+        q25, q50, q75 = layer_df["risk_score"].quantile([.25, .5, .75]).round(4)
+        st.caption(f"Q25={q25:.4f} • Q50={q50:.4f} • Q75={q75:.4f}")
+        
 # ---------- Planning ----------
 with tabs[2]:
     st.subheader("🚓 Devriye Planlama (yakında)")
