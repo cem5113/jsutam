@@ -130,7 +130,7 @@ def read_risk_from_artifact() -> pd.DataFrame:
     miss = need - set(df.columns)
     if miss:
         raise ValueError(f"Eksik kolon(lar): {', '.join(sorted(miss))}")
-
+    return d
 
 @st.cache_data(ttl=60*60, show_spinner=False)
 def fetch_geojson_smart(path_local: str, path_in_zip: str, raw_owner: str, raw_repo: str) -> dict:
@@ -184,50 +184,95 @@ def load_exposure_fallback() -> pd.DataFrame:
         return pd.DataFrame(columns=["geoid","season","day_of_week","event_hour","exposure_guess"])
 
 def attach_pred_expected(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    risk_hourly df'sine 'pred_expected' ekler.
+    Öncelik sırası:
+      1) geoid + season + dow + hour  (expo: geoid + season + day_of_week + event_hour)
+      2) geoid + hour
+      3) geoid ortalaması
+      4) fallback sabit 0.3
+    """
+    if df is None:
+        raise ValueError("read_risk_from_artifact() None döndü.")
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("attach_pred_expected(df): df bir DataFrame olmalı.")
+    if df.empty:
+        out = df.copy()
+        out["pred_expected"] = []
+        return out
+
+    if "risk_score" not in df.columns:
+        raise ValueError("attach_pred_expected: 'risk_score' kolonu yok.")
+
+    # Zaten varsa dokunma
     if "pred_expected" in df.columns:
         return df
 
+    # --- exposure kaynağını al ---
     expo = load_exposure_fallback()
+    out = df.copy()
+
     if expo.empty:
         st.warning("Exposure kaynağı yüklenemedi → geçici 0.3 tabanı kullanılıyor.")
-        out = df.copy()
         out["pred_expected"] = (out["risk_score"] * 0.3).round(3)
         return out
 
-    out = df.copy()
-    expo = expo.copy()
-    expo["day_of_week"] = pd.to_numeric(expo["day_of_week"], errors="coerce").fillna(0).astype(int)
-    expo["event_hour"]  = pd.to_numeric(expo["event_hour"],  errors="coerce").fillna(0).astype(int)
-    expo["season"] = expo["season"].astype(str)
+    # --- tip/isim normalizasyonu ---
+    # risk df
+    out["geoid"] = out["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
+    if "hour" not in out.columns and "hour_range" in out.columns:
+        out["hour"] = pd.to_numeric(out["hour_range"], errors="coerce").fillna(0).astype(int)
+    out["hour"] = pd.to_numeric(out["hour"], errors="coerce").fillna(0).astype(int)
+    if "dow" not in out.columns and "date" in out.columns:
+        out["dow"] = pd.to_datetime(out["date"], errors="coerce").dt.dayofweek.fillna(0).astype(int)
+    out["dow"] = pd.to_numeric(out["dow"], errors="coerce").fillna(0).astype(int)
+    out["season"] = out.get("season", "All")
+    out["season"] = out["season"].astype(str)
 
-    # 1) tam eşleşme: geoid + season + dow + hour  (dow = day_of_week, hour = event_hour)
+    # expo df
+    expo = expo.copy()
+    # Normalize names from sf_crime_09: GEOID, season, day_of_week, event_hour, exposure_guess
+    if "geoid" not in expo.columns and "GEOID" in expo.columns:
+        expo["geoid"] = expo["GEOID"]
+    expo["geoid"] = expo["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
+    expo["season"] = expo.get("season", "All").astype(str)
+    expo["day_of_week"] = pd.to_numeric(expo.get("day_of_week", 0), errors="coerce").fillna(0).astype(int)
+    expo["event_hour"]  = pd.to_numeric(expo.get("event_hour", 0),  errors="coerce").fillna(0).astype(int)
+    if "exposure_guess" not in expo.columns:
+        expo["exposure_guess"] = 0.3
+
+    # --- 1) tam eşleşme: geoid + season + dow + hour ---
     m = out.merge(
-        expo,
+        expo[["geoid","season","day_of_week","event_hour","exposure_guess"]],
         left_on=["geoid","season","dow","hour"],
         right_on=["geoid","season","day_of_week","event_hour"],
         how="left"
     )
 
-    # 2) olmadıysa: geoid + hour
+    # --- 2) geoid + hour (hala NaN kalanlara uygula) ---
     miss = m["exposure_guess"].isna()
     if miss.any():
-        m.loc[miss, "exposure_guess"] = out.merge(
+        j = out.merge(
             expo[["geoid","event_hour","exposure_guess"]],
             left_on=["geoid","hour"],
             right_on=["geoid","event_hour"],
             how="left"
-        )["exposure_guess_y"]
+        )["exposure_guess"]
+        m.loc[miss, "exposure_guess"] = j[miss].values
 
-    # 3) olmadıysa: geoid ortalaması
+    # --- 3) geoid ortalaması ---
     miss = m["exposure_guess"].isna()
     if miss.any():
         ge_mean = expo.groupby("geoid", as_index=False)["exposure_guess"].mean()
-        m.loc[miss, "exposure_guess"] = out.merge(
-            ge_mean, on="geoid", how="left"
-        )["exposure_guess_y"]
+        j = out.merge(ge_mean, on="geoid", how="left")["exposure_guess"]
+        m.loc[miss, "exposure_guess"] = j[miss].values
 
+    # --- 4) fallback ---
     m["exposure_guess"] = m["exposure_guess"].fillna(0.3)
-    m["pred_expected"] = (m["risk_score"] * m["exposure_guess"]).round(3)
+
+    # sonuç
+    m["pred_expected"] = (pd.to_numeric(m["risk_score"], errors="coerce").fillna(0.0) *
+                          pd.to_numeric(m["exposure_guess"], errors="coerce").fillna(0.3)).round(3)
     return m
     
 # -------------------------
