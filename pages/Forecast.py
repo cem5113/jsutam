@@ -157,8 +157,9 @@ def _ensure_ts_cols(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("Forecast için 'date' sütunu gerekli (yyyy-mm-dd).")
 
     df["date"] = pd.to_datetime(df["date"]).dt.date
-    df["ts"] = pd.to_datetime(df["date"]) + pd.to_timedelta(df["hour"], unit="h")
-    df["dow"] = pd.to_datetime(df["date"]).weekday  # 0=Mon ... 6=Sun
+    df["ts"] = sdt + pd.to_timedelta(df["hour"], unit="h")
+    sdt = pd.to_datetime(df["date"], errors="coerce")
+    df["dow"] = sdt.dt.weekday
     return df
 
 def build_naive_forecast(df_hist: pd.DataFrame, start_dt: datetime, end_dt: datetime, k_weeks: int = 4) -> pd.DataFrame:
