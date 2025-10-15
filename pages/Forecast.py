@@ -53,7 +53,7 @@ RAW_GEOJSON_REPO  = "crimepredict"
 GITHUB_TOKEN = st.secrets.get("github_token", os.environ.get("GITHUB_TOKEN", ""))
 
 st.set_page_config(page_title="🧭 Suç Tahmini (Forecast)", layout="wide")
-now = datetime.now() 
+
 
 # =========================
 # Yardımcılar — IO
@@ -145,99 +145,6 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
         elif "risk" in df.columns: df = df.rename(columns={"risk":"risk_score"})
     return df
 
-def _ensure_ts_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    date + hour'dan zaman damgası (ts) ve haftanın günü (dow) üretir.
-    hour yoksa hour_from / hour_range'tan türetir.
-    """
-    df = df.copy()
-
-    # --- HOUR alanını güvenle oluştur ---
-    if "hour" in df.columns:
-        df["hour"] = pd.to_numeric(df["hour"], errors="coerce")
-    elif "hour_from" in df.columns:
-        df["hour"] = pd.to_numeric(df["hour_from"], errors="coerce")
-    elif "hour_range" in df.columns:
-        # "18-20" -> 18
-        hr0 = df["hour_range"].astype(str).str.extract(r"(\d{1,2})")[0]
-        df["hour"] = pd.to_numeric(hr0, errors="coerce")
-    else:
-        df["hour"] = np.nan
-
-    df["hour"] = df["hour"].fillna(0).astype(int).clip(0, 23)
-
-    # --- DATE alanını güvenle datetime64'e çevir ---
-    if "date" not in df.columns:
-        raise ValueError("Forecast için 'date' sütunu gerekli (yyyy-mm-dd).")
-
-    # Not: _normalize_cols() içinde .dt.date yapılmış olabilir; yine de güvenli dönüştür.
-    sdt = pd.to_datetime(df["date"], errors="coerce")
-
-    # --- ts ve dow üret ---
-    df["ts"] = sdt + pd.to_timedelta(df["hour"], unit="h")
-    df["dow"] = sdt.dt.weekday  # 0=Mon ... 6=Sun
-
-    return df
-
-def build_naive_forecast(df_hist: pd.DataFrame, start_dt: datetime, end_dt: datetime, k_weeks: int = 4) -> pd.DataFrame:
-    """
-    [start_dt, end_dt) aralığı için mevsimsel-naive forecast üretir.
-    Her GEOID + (dow, hour) için son k haftanın ortalaması alınır.
-    """
-    if df_hist.empty:
-        return df_hist.iloc[0:0].copy()
-
-    base = df_hist.copy()
-    # referans anahtar: GEOID + (dow,hour)
-    key_cols = ["geoid", "dow", "hour"]
-    agg = (
-        base.groupby(key_cols, as_index=False)
-            .agg(
-                risk_score=("risk_score", "mean"),
-                pred_expected=("pred_expected", "mean")
-            )
-    )
-
-    # geleceğe zaman ızgarası
-    future_hours = int((end_dt - start_dt).total_seconds() // 3600)
-    grid = []
-    for h in range(future_hours):
-        ts = start_dt + timedelta(hours=h)
-        grid.append((ts, ts.weekday(), ts.hour))
-    grid_df = pd.DataFrame(grid, columns=["ts", "dow", "hour"])
-    grid_df["date"] = grid_df["ts"].dt.date
-
-    # GEOID çapraz çarpımı (tüm hücreler için üret)
-    geoids = base["geoid"].astype(str).unique().tolist()
-    geo_df = pd.DataFrame({"geoid": geoids})
-    fut = grid_df.merge(geo_df, how="cross")
-
-    # referans ortalamalarla birleştir
-    fut = fut.merge(agg, on=["geoid", "dow", "hour"], how="left")
-
-    # eğer tamamen boşsa, her GEOID için tarihçe ortalamasıyla doldur
-    if fut["risk_score"].isna().all():
-        by_g = base.groupby("geoid", as_index=False).agg(
-            risk_score=("risk_score", "mean"),
-            pred_expected=("pred_expected", "mean")
-        )
-        fut = fut.drop(columns=["risk_score", "pred_expected"]).merge(by_g, on="geoid", how="left")
-
-    # kalan boşları da GEOID ortalamasıyla doldur
-    by_g_any = base.groupby("geoid")[["risk_score", "pred_expected"]].mean()
-    fut[["risk_score", "pred_expected"]] = fut.apply(
-        lambda r: r[["risk_score", "pred_expected"]].fillna(by_g_any.loc[r["geoid"]]) if r["geoid"] in by_g_any.index else r[["risk_score", "pred_expected"]],
-        axis=1
-    )
-
-    # app'in beklediği kolonları garanti et
-    fut["hour_range"] = fut["hour"].astype(int).astype(str)
-    fut["GEOID"] = fut["geoid"]
-    fut = fut[
-        ["geoid", "GEOID", "date", "hour", "dow", "hour_range", "risk_score", "pred_expected"]
-    ]
-    return fut
-
 @st.cache_data(show_spinner=True, ttl=15*60)
 def read_risk_from_artifact() -> pd.DataFrame:
     zip_bytes = fetch_latest_artifact_zip(OWNER, REPO, ARTIFACT_NAME)
@@ -298,47 +205,24 @@ def slice_24h(df: pd.DataFrame, d: date, hour: int) -> pd.DataFrame:
         m = m & (df["hour_from"] == int(hour))
     return df.loc[m].copy()
 
-def _coerce_hour_if_missing(df: pd.DataFrame) -> pd.DataFrame:
-    if "hour" not in df.columns and "hour_range" in df.columns:
-        hr0 = pd.to_numeric(df["hour_range"].astype(str).str.extract(r"(\d{1,2})")[0], errors="coerce").fillna(0).astype(int)
-        df = df.copy()
-        df["hour"] = hr0.clip(0, 23)
-    return df
-
 def slice_72h_bins(df: pd.DataFrame, start_dt: datetime, bin_index: int) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    start_dt dahil 72 saatlik pencereyi al.
-    Her satırı gerçek timestamp'e çevir: ts = date + hour.
-    Sonra (ts - start_dt) / 3s → 0..23 blok; seçilen bloğu döndür.
-    """
-    sdf = df.copy()
-
-    # hour yoksa hour_from'u kullan
+    """72 saatlik pencerede 3'er saatlik 24 blok (0..23). bin_index: gösterilecek blok."""
+    dt_end = start_dt + timedelta(hours=72)
+    m_date = (pd.to_datetime(df["date"]).between(start_dt.date(), dt_end.date()))
+    sdf = df.loc[m_date].copy()
+    # hour zorunlu; yoksa hour_from
     if "hour" not in sdf.columns and "hour_from" in sdf.columns:
-        sdf["hour"] = sdf["hour_from"].astype(int)
-    else:
-        sdf["hour"] = pd.to_numeric(sdf["hour"], errors="coerce").fillna(0).astype(int)
-
-    # gerçek zaman damgası
-    ts = pd.to_datetime(sdf["date"]) + pd.to_timedelta(sdf["hour"], unit="h")
-    sdf["ts"] = ts
-
-    end_dt = start_dt + timedelta(hours=72)
-    sdf = sdf[(sdf["ts"] >= start_dt) & (sdf["ts"] < end_dt)].copy()
-    if sdf.empty:
-        return sdf, [f"{i*3:02d}-{i*3+2:02d}" for i in range(24)]
-
-    # 3 saatlik blok indexi: 0..23
-    sdf["bin"] = (((sdf["ts"] - start_dt).dt.total_seconds() // 3600) // 3).astype(int).clip(0, 23)
-
-    bins_labels = [f"{i*3:02d}-{i*3+2:02d}" for i in range(24)]
-    bin_index = int(max(0, min(23, bin_index)))
+        sdf["hour"] = sdf["hour_from"]
+    sdf["bin"] = (sdf["hour"] // 3).astype(int)  # 0..7 günde 24*? (gün sınırı önemli değil)
+    # seçili 72h aralığa indir
+    # saat mutlak değil; pratikte kullanıcı seçimi + tarih ile eşleriz
+    # burada basitçe sadece bin'e göre gösterimi yapacağız
+    bins_labels = [f"{i*3:02d}-{i*3+2:02d}" for i in range(8)]
     show = sdf[sdf["bin"] == bin_index].copy()
-
-    # agregasyon: blok içi
+    # agregasyon
     show = show.groupby(["geoid"], as_index=False).agg(
-        risk_score=("risk_score", "mean"),
-        pred_expected=("pred_expected", "sum"),
+        risk_score=("risk_score","mean"),
+        pred_expected=("pred_expected","sum"),
     )
     return show, bins_labels
 
@@ -525,42 +409,23 @@ st.caption("Zaman ufku seç, ısı haritasını gör, bir bölgeye tıkla → po
 
 with st.sidebar:
     st.header("Zaman & Filtreler")
-
-    now = datetime.now()
-    now_str = now.strftime("%Y-%m-%d %H:%M")
-
-    horizon = st.radio(
-        f"Ufuk (şimdi: {now_str})",
-        ["Anlık (şimdi)", "24 saat (saatlik)", "72 saat (3s blok)", "1 hafta (günlük)"],
-        index=0,
-    )
-
+    horizon = st.radio("Ufuk", ["24 saat (saatlik)","72 saat (3s blok)","1 hafta (günlük)"])
     today = date.today()
     base_date = st.date_input("Tarih", value=today)
-
     if "24 saat" in horizon:
-        hour_sel = st.slider("Saat", 0, 23, now.hour)
+        hour_sel = st.slider("Saat", 0, 23, 18)
     elif "72 saat" in horizon:
-        start_hour = st.slider("Başlangıç saati (72h)", 0, 23, now.hour)
-        bin_index = st.selectbox(
-            "Gösterilecek 3s blok (0..23)",
-            list(range(24)),
-            index=(now.hour // 3),
-            format_func=lambda i: f"{i*3:02d}-{i*3+2:02d}",
-        )
-    elif "1 hafta" in horizon:
+        start_hour = st.slider("Başlangıç saati (72h)", 0, 23, 0)
+        bin_index = st.selectbox("Gösterilecek 3s blok", list(range(8)), index=6, format_func=lambda i: f"{i*3:02d}-{i*3+2:02d}")
+    else:
         day_index = st.selectbox("Gösterilecek gün (0..6)", list(range(7)), index=0)
-
     refresh = st.button("Veriyi Yenile")
-    if refresh:
-        now = datetime.now()
 
     st.divider()
     st.subheader("Harita sınırları")
     geojson_local = st.text_input("Local yol", value=GEOJSON_PATH_LOCAL_DEFAULT)
     geojson_zip   = st.text_input("Artifact ZIP içi yol", value=GEOJSON_IN_ZIP_PATH_DEFAULT)
 
-# veri oku
 # veri oku
 try:
     if refresh:
@@ -575,92 +440,27 @@ except Exception as e:
 
 risk = ensure_pred_expected(risk)
 
-# Zaman alanlarını hazırla
-risk = _ensure_ts_cols(risk)
-
-# Kullanıcının seçimine göre geleceğe ihtiyaç varsa forecast üret
-# (UI değişkenleri henüz yoksa defaults al)
-_base_date = locals().get("base_date", date.today())
-_now = locals().get("now", datetime.now())
-_start_hour = int(locals().get("start_hour", _now.hour))
-
-need_future = False
-future_start = None
-future_end = None
-
-# 24 saat görünümü gelecekteyse
-if "horizon" in locals() and "24 saat" in locals().get("horizon"):
-    # seçilen tarih/saat gelecekte mi?
-    sel_dt = datetime.combine(_base_date, datetime.min.time()).replace(hour=int(locals().get("hour_sel", _now.hour)))
-    if sel_dt > risk["ts"].max():
-        need_future = True
-        future_start = sel_dt
-        future_end = sel_dt + timedelta(hours=1)
-
-# 72 saat görünümü gelecekte başlangıç istiyorsa
-elif "horizon" in locals() and "72 saat" in locals().get("horizon"):
-    sel_dt = datetime.combine(_base_date, datetime.min.time()).replace(hour=_start_hour)
-    if sel_dt + timedelta(hours=72) > risk["ts"].max():
-        need_future = True
-        future_start = max(risk["ts"].max() + timedelta(hours=1), sel_dt)
-        future_end = sel_dt + timedelta(hours=72)
-
-# 1 hafta görünümü için
-elif "horizon" in locals() and "1 hafta" in locals().get("horizon"):
-    sel_dt = datetime.combine(_base_date, datetime.min.time())
-    if sel_dt + timedelta(days=7) > risk["ts"].max():
-        need_future = True
-        future_start = max(risk["ts"].max() + timedelta(hours=1), sel_dt)
-        future_end = sel_dt + timedelta(days=7)
-
-# Forecast gerekiyorsa üret ve risk'e ekle
-if need_future and future_start is not None and future_end is not None:
-    fut = build_naive_forecast(risk, future_start, future_end, k_weeks=4)
-    # gelecek için eksik olabilir diye öncelik hesaplarında kullanılan kolonları garanti altına al
-    for col in ["priority"]:
-        if col in fut.columns and fut[col].isna().any():
-            fut[col] = fut[col].fillna("zero")
-    # risk ile aynı kolon setine gel
-    common = list(set(risk.columns) & set(fut.columns))
-    risk = pd.concat([risk, fut[common]], ignore_index=True, axis=0)
-
-# kategori filtresi
+# kategori filtresi (varsa)
 cand_cols = [c for c in ["offense","offense_category","crime_type","primary_type"] if c in risk.columns]
-with st.sidebar:
-    if cand_cols:
-        cat_col = cand_cols[0]
+if cand_cols:
+    cat_col = cand_cols[0]
+    with st.sidebar:
         cats = sorted([c for c in risk[cat_col].dropna().astype(str).unique() if c != ""])
-        chosen = st.multiselect("Suç kategorisi", cats, default=[])
-    else:
-        st.caption("Suç kategorisi sütunu bulunamadı.")
-        chosen = []
+        chosen = st.multiselect("Suç kategorisi (opsiyonel)", cats, default=[])
+    if chosen:
+        risk = risk[risk[cat_col].astype(str).isin(chosen)].copy()
 
-if chosen:
-    risk = risk[risk[cat_col].astype(str).isin(chosen)].copy()
-
-hour_sel = locals().get("hour_sel", now.hour)
-start_hour = locals().get("start_hour", now.hour)
-day_index = locals().get("day_index", 0)
-bin_index = locals().get("bin_index", 0)
-
-if horizon == "Anlık (şimdi)":
-    sl = slice_24h(risk, now.date(), now.hour)
-    time_label = f"Anlık — {now.strftime('%Y-%m-%d %H:00')}"
-elif "24 saat" in horizon:
+# slice
+if "24 saat" in horizon:
     sl = slice_24h(risk, base_date, hour_sel)
     time_label = f"{base_date} — {hour_sel:02d}:00"
 elif "72 saat" in horizon:
     start_dt = datetime.combine(base_date, datetime.min.time()).replace(hour=start_hour)
     sl, bins_labels = slice_72h_bins(risk, start_dt, bin_index)
-    time_label = f"{base_date} +72h — blok {bin_index} ({bins_labels[bin_index]})"
+    time_label = f"{base_date} +72h — blok {bins_labels[bin_index]}"
 else:
     sl, days_labels = slice_weekly(risk, base_date, day_index)
-    pick = days_labels[day_index] if days_labels else str(base_date)
-    time_label = f"{base_date} +7g — gün {day_index} ({pick})"
-
-if sl.empty and risk["date"].max() >= base_date:
-    # zaten geçmiş mevcut; sadece filtre sonucu boşalmış olabilir
-    pass
+    time_label = f"{base_date} +7g — gün {day_index} ({days_labels[day_index] if days_labels else ''})"
 
 if sl.empty:
     st.warning("Seçili aralıkta veri bulunamadı.")
@@ -688,6 +488,7 @@ folium_map, centroids = render_map(geojson_enriched, sl, value_col="pred_expecte
 mres = st_folium(folium_map, width=None, height=600, use_container_width=True)
 
 st.subheader(f"Harita — {time_label}")
+mres = st_folium(folium_map, width=None, height=600, use_container_width=True)
 
 # KPI kutuları
 c1, c2, c3, c4 = st.columns(4)
