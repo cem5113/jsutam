@@ -20,6 +20,9 @@ GEOJSON_IN_ZIP_PATH_DEFAULT = "data/sf_cells.geojson"
 RAW_GEOJSON_OWNER = "cem5113"
 RAW_GEOJSON_REPO  = "crimepredict"
 
+RAW_C09 = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/crime_prediction_data/sf_crime_09.parquet"
+
+# Artifact ve raw’da farklı klasör/uzantı ihtimallerine karşı
 C09_CANDIDATES = [
     "sf_crime_09.parquet",
     "crime_prediction_data/sf_crime_09.parquet",
@@ -421,20 +424,25 @@ try:
 
     with st.expander("🔎 Teşhis (geçici)"):
         st.write("risk_hourly:", base_df.shape, list(base_df.columns))
-        import traceback, textwrap, requests as _rq
-        try:
-            _r = _rq.get(RAW_C09, timeout=20)
-            st.write("sf_crime_09 HTTP:", _r.status_code, RAW_C09)
-            if _r.status_code == 200:
-                import io as _io
-                _preview = pd.read_parquet(_io.BytesIO(_r.content), nrows=5)
-                st.write("sf_crime_09 örnek:", _preview.shape, list(_preview.columns))
-            else:
-                st.code(_r.text[:500])
-        except Exception as e:
-            st.error("sf_crime_09 okunamadı (ayrıntı):")
-            st.code(textwrap.fill(str(e), 100))
-            st.code(textwrap.fill(traceback.format_exc(), 100))
+        import traceback, textwrap, requests as _rq, io as _io
+        ok = False
+        for u in RAW_C09_URLS:
+            try:
+                _r = _rq.get(u, timeout=20)
+                st.write("sf_crime_09 HTTP:", _r.status_code, u)
+                if _r.status_code == 200:
+                    if u.lower().endswith(".csv"):
+                        _preview = pd.read_csv(_io.BytesIO(_r.content), nrows=5)
+                    else:
+                        _preview = pd.read_parquet(_io.BytesIO(_r.content))
+                    st.write("sf_crime_09 örnek:", _preview.shape, list(_preview.columns))
+                    ok = True
+                    break
+            except Exception as e:
+                st.code(textwrap.fill(f"Tried {u} → {e}", 100))
+        if not ok:
+            st.warning("sf_crime_09 hiçbir RAW URL’den okunamadı.")
+
             
 except Exception as e:
     st.error(f"Artifact indirilemedi/okunamadı: {e}")
