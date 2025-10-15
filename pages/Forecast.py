@@ -34,6 +34,7 @@ RAW_C09_URLS = [
     f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/sf_crime_09.parquet.gzip",
     f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/sf_crime_09.csv",
     f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/crime_prediction_data/sf_crime_09.csv",
+]
 
 GITHUB_TOKEN = st.secrets.get("github_token", os.environ.get("GITHUB_TOKEN", ""))
 
