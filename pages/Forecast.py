@@ -206,23 +206,39 @@ def slice_24h(df: pd.DataFrame, d: date, hour: int) -> pd.DataFrame:
     return df.loc[m].copy()
 
 def slice_72h_bins(df: pd.DataFrame, start_dt: datetime, bin_index: int) -> Tuple[pd.DataFrame, List[str]]:
-    """72 saatlik pencerede 3'er saatlik 24 blok (0..23). bin_index: gösterilecek blok."""
-    dt_end = start_dt + timedelta(hours=72)
-    m_date = (pd.to_datetime(df["date"]).between(start_dt.date(), dt_end.date()))
-    sdf = df.loc[m_date].copy()
-    # hour zorunlu; yoksa hour_from
+    """
+    start_dt dahil 72 saatlik pencereyi al.
+    Her satırı gerçek timestamp'e çevir: ts = date + hour.
+    Sonra (ts - start_dt) / 3s → 0..23 blok; seçilen bloğu döndür.
+    """
+    sdf = df.copy()
+
+    # hour yoksa hour_from'u kullan
     if "hour" not in sdf.columns and "hour_from" in sdf.columns:
-        sdf["hour"] = sdf["hour_from"]
-    sdf["bin"] = (sdf["hour"] // 3).astype(int)  # 0..7 günde 24*? (gün sınırı önemli değil)
-    # seçili 72h aralığa indir
-    # saat mutlak değil; pratikte kullanıcı seçimi + tarih ile eşleriz
-    # burada basitçe sadece bin'e göre gösterimi yapacağız
-    bins_labels = [f"{i*3:02d}-{i*3+2:02d}" for i in range(8)]
+        sdf["hour"] = sdf["hour_from"].astype(int)
+    else:
+        sdf["hour"] = pd.to_numeric(sdf["hour"], errors="coerce").fillna(0).astype(int)
+
+    # gerçek zaman damgası
+    ts = pd.to_datetime(sdf["date"]) + pd.to_timedelta(sdf["hour"], unit="h")
+    sdf["ts"] = ts
+
+    end_dt = start_dt + timedelta(hours=72)
+    sdf = sdf[(sdf["ts"] >= start_dt) & (sdf["ts"] < end_dt)].copy()
+    if sdf.empty:
+        return sdf, [f"{i*3:02d}-{i*3+2:02d}" for i in range(24)]
+
+    # 3 saatlik blok indexi: 0..23
+    sdf["bin"] = (((sdf["ts"] - start_dt).dt.total_seconds() // 3600) // 3).astype(int).clip(0, 23)
+
+    bins_labels = [f"{i*3:02d}-{i*3+2:02d}" for i in range(24)]
+    bin_index = int(max(0, min(23, bin_index)))
     show = sdf[sdf["bin"] == bin_index].copy()
-    # agregasyon
+
+    # agregasyon: blok içi
     show = show.groupby(["geoid"], as_index=False).agg(
-        risk_score=("risk_score","mean"),
-        pred_expected=("pred_expected","sum"),
+        risk_score=("risk_score", "mean"),
+        pred_expected=("pred_expected", "sum"),
     )
     return show, bins_labels
 
@@ -424,21 +440,19 @@ with st.sidebar:
 
     # Kontrolleri ufka göre göster
     if horizon == "Anlık (şimdi)":
-        st.caption(f"Seçilen: {now.strftime('%Y-%m-%d %H:00')}")
-        hour_sel = now.hour  # kullanılacak
+        sl = slice_24h(risk, now.date(), now.hour)
+        time_label = f"Anlık — {now.strftime('%Y-%m-%d %H:00')}"
     elif "24 saat" in horizon:
-        hour_sel = st.slider("Saat", 0, 23, now.hour)
+        sl = slice_24h(risk, base_date, hour_sel)
+        time_label = f"{base_date} — {hour_sel:02d}:00"
     elif "72 saat" in horizon:
-        start_hour = st.slider("Başlangıç saati (72h)", 0, 23, now.hour)
-        bin_index = st.selectbox(
-            "Gösterilecek 3s blok (0..23)",
-            list(range(24)),
-            index=min(23, (now.hour // 3)),  # mantıklı varsayılan
-            format_func=lambda i: f"{i*3:02d}-{i*3+2:02d}",
-        )
+        start_dt = datetime.combine(base_date, datetime.min.time()).replace(hour=start_hour)
+        sl, bins_labels = slice_72h_bins(risk, start_dt, bin_index)
+        time_label = f"{base_date} +72h — blok {bin_index} ({bins_labels[bin_index]})"
     else:
-        # 1 hafta
-        day_index = st.selectbox("Gösterilecek gün (0..6)", list(range(7)), index=0)
+        sl, days_labels = slice_weekly(risk, base_date, day_index)
+        pick = days_labels[day_index] if days_labels else str(base_date)
+        time_label = f"{base_date} +7g — gün {day_index} ({pick})"
 
     refresh = st.button("Veriyi Yenile")
 
@@ -463,13 +477,17 @@ risk = ensure_pred_expected(risk)
 
 # kategori filtresi (varsa)
 cand_cols = [c for c in ["offense","offense_category","crime_type","primary_type"] if c in risk.columns]
-if cand_cols:
-    cat_col = cand_cols[0]
-    with st.sidebar:
+with st.sidebar:
+    if cand_cols:
+        cat_col = cand_cols[0]
         cats = sorted([c for c in risk[cat_col].dropna().astype(str).unique() if c != ""])
-        chosen = st.multiselect("Suç kategorisi (opsiyonel)", cats, default=[])
-    if chosen:
-        risk = risk[risk[cat_col].astype(str).isin(chosen)].copy()
+        chosen = st.multiselect("Suç kategorisi", cats, default=[])
+    else:
+        st.caption("Suç kategorisi sütunu bulunamadı.")
+        chosen = []
+
+if chosen:
+    risk = risk[risk[cat_col].astype(str).isin(chosen)].copy()
 
 # slice
 if "24 saat" in horizon:
