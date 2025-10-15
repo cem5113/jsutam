@@ -324,11 +324,16 @@ def enrich_geojson_with_slice(geojson: dict, slice_df: pd.DataFrame, top3_df: pd
             t3 = tmap.get(key)
             if t3:
                 props["top3"] = ", ".join(map(str, t3))
+            else:
+                # <<< kritik: her feature'da top3 anahtarı olsun
+                props.setdefault("top3", "")
         else:
             props.setdefault("geoid", key)
             props.setdefault("pred_expected", 0.0)
             props.setdefault("risk_score", 0.0)
             props.setdefault("priority", "zero")
+            # <<< kritik: her feature'da top3 anahtarı olsun
+            props.setdefault("top3", "")
         out_feats.append({**feat, "properties": props})
     return {**geojson, "features": out_feats}
 
@@ -343,7 +348,9 @@ def make_priority_color(priority: str) -> str:
     return cmap.get(priority, "#CCCCCC")
 
 def render_map(geojson: dict, slice_df: pd.DataFrame, value_col: str = "pred_expected") -> Tuple[folium.Map, Dict[str, Tuple[float,float]]]:
-    geojson = sanitize_props(geojson) 
+    geojson_enriched = enrich_geojson_with_slice(geojson, sl, top3)
+    geojson_enriched = sanitize_props(geojson_enriched)  # <- burada
+    folium_map, centroids = render_map(geojson_enriched, sl, value_col="pred_expected")
     # merkez SF
     m = folium.Map(location=[37.7749, -122.4194], zoom_start=12, tiles="cartodbpositron")
     # Heatmap: centroids + intensity
