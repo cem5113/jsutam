@@ -1,39 +1,30 @@
-import io
-import os
-import json
-import zipfile
+import io, os, json, zipfile
 from datetime import date
-
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
 import requests
 
 # =========================
-# Ayarlar
+# Sabitler
 # =========================
 OWNER = "cem5113"
 REPO = "crime_prediction_data"
 ARTIFACT_NAME = "sf-crime-parquet"
 EXPECTED_PARQUET = "risk_hourly.parquet"
 
-# GeoJSON varsayılan lokal yol (repo'nun içinde mevcut)
 GEOJSON_PATH_LOCAL_DEFAULT = "data/sf_cells.geojson"
-# Artifact içindeki muhtemel yol (yoksa sorun değil; fallback çalışır)
 GEOJSON_IN_ZIP_PATH_DEFAULT = "data/sf_cells.geojson"
 
-# Raw GitHub fallback (public)
 RAW_GEOJSON_OWNER = "cem5113"
-RAW_GEOJSON_REPO = "crimepredict"
+RAW_GEOJSON_REPO  = "crimepredict"
 
-# Actions artifact indirmek için token gerekir
 GITHUB_TOKEN = st.secrets.get("github_token", os.environ.get("GITHUB_TOKEN", ""))
 
-st.set_page_config(page_title="Suç Risk Haritası (Günlük)", layout="wide")
-st.title("Suç Risk Haritası — Günlük Ortalama (low / medium / high / critical)")
+st.set_page_config(page_title="Suç Tahmini Uygulaması", layout="wide")
 
 # =========================
-# Yardımcılar
+# Yardımcılar (GENEL)
 # =========================
 def _gh_headers():
     hdrs = {"Accept": "application/vnd.github+json"}
@@ -41,19 +32,10 @@ def _gh_headers():
         hdrs["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return hdrs
 
-
 def _digits(s: str) -> str:
     return "".join(ch for ch in str(s) if ch.isdigit())
 
-
-def _mode_len(seq: list[str]) -> int:
-    if not seq:
-        return 0
-    from collections import Counter
-    return Counter(len(x) for x in seq if x).most_common(1)[0][0]
-
-
-@st.cache_data(show_spinner=True, ttl=15 * 60)
+@st.cache_data(show_spinner=True, ttl=15*60)
 def fetch_latest_artifact_zip(owner: str, repo: str, artifact_name: str) -> bytes:
     if not GITHUB_TOKEN:
         raise RuntimeError("GitHub token yok. `st.secrets['github_token']` veya GITHUB_TOKEN env ayarlayın.")
@@ -72,9 +54,9 @@ def fetch_latest_artifact_zip(owner: str, repo: str, artifact_name: str) -> byte
     r2.raise_for_status()
     return r2.content
 
-
-@st.cache_data(show_spinner=True, ttl=15 * 60)
+@st.cache_data(show_spinner=True, ttl=15*60)
 def read_risk_from_artifact() -> pd.DataFrame:
+    """risk_hourly.parquet -> kolonları normalize et."""
     zip_bytes = fetch_latest_artifact_zip(OWNER, REPO, ARTIFACT_NAME)
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         memlist = zf.namelist()
@@ -84,29 +66,64 @@ def read_risk_from_artifact() -> pd.DataFrame:
         with zf.open(matches[0]) as f:
             df = pd.read_parquet(f)
 
-    # kolon adları
+    # kolon adlarını normalize et
     df.columns = [c.strip().lower() for c in df.columns]
 
-    # GEOID kolonunu bul/oluştur
+    # GEOID çıkar / normalize
     if "geoid" not in df.columns:
         for alt in ["cell_id", "geoid10", "geoid11", "geoid_10", "geoid_11", "id"]:
             if alt in df.columns:
                 df["geoid"] = df[alt]
                 break
+    df["geoid"] = df["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
 
-    # (1) stringe çevir + sadece rakam
-    df["geoid"] = df["geoid"].astype(str).str.replace(r"\D", "", regex=True)
-
-    # (2) tract uzunluğu: 11 hane olacak şekilde başı sıfırla doldur
-    df["geoid"] = df["geoid"].str.zfill(11)
-
-    # tarih
+    # tarih varsa
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"]).dt.date
 
+    # risk kolonunu aliasla (artifact'a göre değişebilir: proba / risk_score / risk)
+    if "risk_score" not in df.columns:
+        if "proba" in df.columns:
+            df = df.rename(columns={"proba": "risk_score"})
+        elif "risk" in df.columns:
+            df = df.rename(columns={"risk": "risk_score"})
+        # değilse zaten risk_score vardır veya üstte rename edildi
+
     return df
 
+@st.cache_data(show_spinner=True, ttl=60*60)
+def fetch_geojson_smart(path_local: str, path_in_zip: str, raw_owner: str, raw_repo: str) -> dict:
+    # 1) Local
+    try:
+        if os.path.exists(path_local):
+            with open(path_local, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    # 2) Artifact ZIP
+    try:
+        zip_bytes = fetch_latest_artifact_zip(OWNER, REPO, ARTIFACT_NAME)
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            memlist = zf.namelist()
+            candidates = [n for n in memlist if n.endswith("/" + path_in_zip) or n.endswith(path_in_zip)]
+            if candidates:
+                with zf.open(candidates[0]) as f:
+                    return json.load(io.TextIOWrapper(f, encoding="utf-8"))
+    except Exception:
+        pass
+    # 3) Raw GitHub
+    try:
+        raw = f"https://raw.githubusercontent.com/{raw_owner}/{raw_repo}/main/{path_local}"
+        r = requests.get(raw, timeout=30)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {}
 
+# =========================
+# Home sekmesi yardımcıları
+# =========================
 def daily_average(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -120,186 +137,84 @@ def daily_average(df: pd.DataFrame) -> pd.DataFrame:
         .rename(columns={"risk_score": "risk_score_daily"})
     )
 
-
 def classify_quantiles(daily_df: pd.DataFrame, day: date) -> pd.DataFrame:
     one = daily_df[daily_df["date"] == day].copy()
     if one.empty:
         return one
     q25, q50, q75 = one["risk_score_daily"].quantile([0.25, 0.5, 0.75]).tolist()
-
     def lab(x: float) -> str:
-        if x <= q25:
-            return "low"
-        elif x <= q50:
-            return "medium"
-        elif x <= q75:
-            return "high"
+        if x <= q25:   return "low"
+        elif x <= q50:return "medium"
+        elif x <= q75:return "high"
         return "critical"
-
     one["risk_level"] = one["risk_score_daily"].apply(lab)
     one["q25"], one["q50"], one["q75"] = q25, q50, q75
     return one
 
-
-def _detect_geojson_id_len(gj: dict) -> int | None:
-    if not gj:
-        return None
-    lens = []
-    for feat in gj.get("features", [])[:200]:
-        props = feat.get("properties", {}) or {}
-        for k in ("geoid", "GEOID", "cell_id", "id"):
-            if k in props:
-                digits = "".join(ch for ch in str(props[k]) if ch.isdigit())
-                if digits:
-                    lens.append(len(digits))
-                break
-    return max(set(lens), key=lens.count) if lens else None
-
-
 def inject_properties(geojson_dict: dict, day_df: pd.DataFrame) -> dict:
-    """
-    day_df: 'geoid', 'risk_score_daily' (ve opsiyonel 'risk_level') içermeli.
-    GeoJSON'a risk seviyelerini ve renkleri enjekte eder.
-    """
+    """GeoJSON'a risk ve renkleri enjekte et (Home için günlük ortalama)."""
     if not geojson_dict or day_df.empty:
         return geojson_dict
-
     df = day_df.copy()
     df["geoid_digits"] = df["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
-    df_key = (
-        df.groupby("geoid_digits", as_index=True)["risk_score_daily"]
-        .mean()
-        .to_frame()
-        .reset_index()
-        .rename(columns={"geoid_digits": "match_key"})
-    )
+    df_key = df.groupby("geoid_digits", as_index=True)["risk_score_daily"].mean().to_frame().reset_index()
+    df_key = df_key.rename(columns={"geoid_digits":"match_key"})
     dmap = df_key.set_index("match_key")
-
     feats = geojson_dict.get("features", [])
     enriched = 0
-    out = []
-
     q25 = float(df["risk_score_daily"].quantile(0.25))
     q50 = float(df["risk_score_daily"].quantile(0.50))
     q75 = float(df["risk_score_daily"].quantile(0.75))
     EPS = 1e-12
-
-    # renk paleti
     COLOR_MAP = {
-        "zero": [200, 200, 200],
-        "low": [56, 168, 0],
-        "medium": [255, 221, 0],
-        "high": [255, 140, 0],
-        "critical": [204, 0, 0],
+        "zero":[200,200,200],
+        "low":[56,168,0],
+        "medium":[255,221,0],
+        "high":[255,140,0],
+        "critical":[204,0,0],
     }
-
+    out=[]
     for feat in feats:
         props = (feat.get("properties") or {}).copy()
-
-        # GEOID benzeri alanı bul
-        raw = None
-        for k in ("geoid", "GEOID", "cell_id", "id"):
-            if k in props:
-                raw = props[k]
-                break
-        if raw is None:
-            for k, v in props.items():
-                if "geoid" in str(k).lower():
-                    raw = v
-                    break
-
-        disp = raw if raw is not None else ""
-        props.setdefault("display_id", str(disp))
-
+        raw=None
+        for k in ("geoid","GEOID","cell_id","id"):
+            if k in props: raw = props[k]; break
+        props.setdefault("display_id", str(raw if raw is not None else ""))
         key = _digits(raw)[:11] if raw is not None else ""
-        lvl = None
+        lvl=None
         if key and key in dmap.index:
             val = float(dmap.loc[key, "risk_score_daily"])
             props["risk_score_daily"] = val
             props["risk_score_txt"] = f"{val:.4f}"
-
-            # seviyeyi belirle
-            if abs(val) <= EPS:
-                lvl = "zero"
-            elif val <= q25:
-                lvl = "low"
-            elif val <= q50:
-                lvl = "medium"
-            elif val <= q75:
-                lvl = "high"
-            else:
-                lvl = "critical"
+            if abs(val) <= EPS: lvl="zero"
+            elif val <= q25:   lvl="low"
+            elif val <= q50:   lvl="medium"
+            elif val <= q75:   lvl="high"
+            else:              lvl="critical"
             enriched += 1
-
-        # seviye/renk set et (yoksa gri)
-        if lvl is None:
-            lvl = props.get("risk_level", "zero")
+        if lvl is None: lvl = props.get("risk_level", "zero")
         props["risk_level"] = lvl
-        props["fill_color"] = COLOR_MAP.get(lvl, [220, 220, 220])
-
+        props["fill_color"] = COLOR_MAP.get(lvl, [220,220,220])
         out.append({**feat, "properties": props})
-
     st.caption(f"Eşleşme özeti → DF(tract,11h): {len(dmap)} anahtar, enjekte: {enriched}/{len(feats)}")
     return {**geojson_dict, "features": out}
 
-
-# ---- GeoJSON akıllı yükleyici: local → artifact → raw ----
-@st.cache_data(show_spinner=True, ttl=60 * 60)
-def fetch_geojson_smart(path_local: str, path_in_zip: str, raw_owner: str, raw_repo: str) -> dict:
-    # 1) Local dosya
-    try:
-        if os.path.exists(path_local):
-            with open(path_local, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-
-    # 2) Artifact içinden
-    try:
-        zip_bytes = fetch_latest_artifact_zip(OWNER, REPO, ARTIFACT_NAME)
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            memlist = zf.namelist()
-            candidates = [n for n in memlist if n.endswith("/" + path_in_zip) or n.endswith(path_in_zip)]
-            if candidates:
-                with zf.open(candidates[0]) as f:
-                    return json.load(io.TextIOWrapper(f, encoding="utf-8"))
-    except Exception:
-        pass
-
-    # 3) Raw GitHub (public)
-    try:
-        raw = f"https://raw.githubusercontent.com/{raw_owner}/{raw_repo}/main/{path_local}"
-        r = requests.get(raw, timeout=30)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-
-    return {}
-
-
-def make_map(geojson_enriched: dict):
-    if not geojson_enriched:
-        st.info("Haritayı görmek için GeoJSON bulunamadı.")
-        return
-
+def make_map_home(geojson_enriched: dict):
     layer = pdk.Layer(
         "GeoJsonLayer",
         geojson_enriched,
         stroked=True,
-        get_line_color=[80, 80, 80],
+        get_line_color=[80,80,80],
         line_width_min_pixels=0.5,
         filled=True,
-        get_fill_color="properties.fill_color",  # <<< BURASI ÖNEMLİ
+        get_fill_color="properties.fill_color",
         pickable=True,
         opacity=0.65,
     )
-
     tooltip = {
-        "html": "<b>GEOID:</b> {display_id}<br/><b>Risk:</b> {risk_level}<br/><b>Skor:</b> {risk_score_txt}",
-        "style": {"backgroundColor": "#262730", "color": "white"},
+        "html":"<b>GEOID:</b> {display_id}<br/><b>Risk:</b> {risk_level}<br/><b>Skor:</b> {risk_score_txt}",
+        "style":{"backgroundColor":"#262730","color":"white"},
     }
-
     deck = pdk.Deck(
         layers=[layer],
         initial_view_state=pdk.ViewState(latitude=37.7749, longitude=-122.4194, zoom=10),
@@ -308,95 +223,208 @@ def make_map(geojson_enriched: dict):
     )
     st.pydeck_chart(deck, use_container_width=True)
 
-    # Basit legend
-    st.markdown(
-        """
-    <div style="display:flex;gap:12px;flex-wrap:wrap;font-size:14px;">
-      <div><span style="display:inline-block;width:14px;height:14px;background:#C8C8C8;border:1px solid #666;"></span> zero</div>
-      <div><span style="display:inline-block;width:14px;height:14px;background:rgb(56,168,0);border:1px solid #666;"></span> low</div>
-      <div><span style="display:inline-block;width:14px;height:14px;background:rgb(255,221,0);border:1px solid #666;"></span> medium</div>
-      <div><span style="display:inline-block;width:14px;height:14px;background:rgb(255,140,0);border:1px solid #666;"></span> high</div>
-      <div><span style="display:inline-block;width:14px;height:14px;background:rgb(204,0,0);border:1px solid #666;"></span> critical</div>
-    </div>
-    """,
-        unsafe_allow_html=True,
+# =========================
+# Forecast sekmesi yardımcıları
+# =========================
+@st.cache_data(ttl=30*60)
+def load_exposure_fallback():
+    """
+    risk_hourly.parquet içinde 'pred_expected' yoksa
+    saatlik exposure tahmini için sf_crime_09.csv'den üret.
+    Mantık: crime_last_7d / 7 ≈ saatlik taban (min 0.1).
+    """
+    try:
+        RAW = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/crime_prediction_data/sf_crime_09.csv"
+        c9 = pd.read_csv(RAW)
+        if "GEOID" not in c9.columns:
+            c9["GEOID"] = c9["GEOID"].astype(str).str.extract(r"(\d+)").fillna("").str[:11]
+        c9["GEOID"] = c9["GEOID"].astype(str).str.replace(r"\D","",regex=True).str.zfill(11)
+        c9["exposure_guess"] = (c9.get("crime_last_7d", 0) / 7.0).clip(lower=0.1)
+        keep = ["GEOID","hour_range","exposure_guess"]
+        return c9[[c for c in keep if c in c9.columns]]
+    except Exception:
+        return pd.DataFrame(columns=["GEOID","hour_range","exposure_guess"])
+
+def make_map_forecast(geojson: dict, df_layer: pd.DataFrame):
+    dmap = df_layer.set_index("geoid")["risk_score"].to_dict()
+    qs = df_layer["risk_score"].quantile([0,.25,.5,.75,1]).tolist()
+    layer = pdk.Layer(
+        "GeoJsonLayer", geojson, stroked=False, opacity=.7, pickable=True,
+        get_fill_color={
+            "function": """
+            const M=Object.fromEntries(py_dmap), Q=py_qs;
+            return (f)=>{
+              const g=String(f.properties.GEOID||f.properties.geoid||"").replace(/\\D/g,"").padStart(11,"0").slice(0,11);
+              const p=(M[g]===undefined)?0:M[g];
+              if (p<=Q[1]) return [178,223,138,220];
+              if (p<=Q[2]) return [255,255,178,220];
+              if (p<=Q[3]) return [254,204,92,230];
+              return [227,26,28,235];
+            }
+            """
+        },
+        parameters={"py_dmap": list(dmap.items()), "py_qs": qs},
+    )
+    tooltip = {
+        "html": (
+            "<b>GEOID:</b> {GEOID}<br/>"
+            "<b>Risk (p):</b> {risk_score}<br/>"
+            "<b>E[olay]:</b> {pred_expected}"
+        )
+    }
+    deck = pdk.Deck(
+        layers=[layer],
+        initial_view_state=pdk.ViewState(latitude=37.7749, longitude=-122.4194, zoom=10),
+        map_style="light",
+        tooltip=tooltip,
+    )
+    st.pydeck_chart(deck, use_container_width=True)
+
+# =========================
+# UI — Sekmeler
+# =========================
+st.title("🗺️ Suç Tahmini Uygulaması")
+
+tabs = st.tabs(["Home", "Forecast", "Planning", "Stats", "Reports"])
+
+# ---------- Home ----------
+with tabs[0]:
+    st.subheader("Suç Risk Haritası — Günlük Ortalama")
+    st.sidebar.header("GitHub Artifact")
+    refresh = st.sidebar.button("Veriyi Yenile (artifact'i tazele)")
+    try:
+        if refresh:
+            fetch_latest_artifact_zip.clear()
+            read_risk_from_artifact.clear()
+            fetch_geojson_smart.clear()
+        risk_df = read_risk_from_artifact()
+    except Exception as e:
+        st.error(f"Artifact indirilemedi/okunamadı: {e}")
+        st.stop()
+
+    risk_daily = daily_average(risk_df)
+    dates = sorted(risk_daily["date"].unique()) if "date" in risk_daily.columns else []
+    sel_date = st.sidebar.selectbox("Gün seçin", dates, index=len(dates)-1, format_func=str) if dates else None
+
+    st.sidebar.header("Harita Sınırları (GeoJSON)")
+    geojson_local = st.sidebar.text_input("Local yol", value=GEOJSON_PATH_LOCAL_DEFAULT)
+    geojson_zip   = st.sidebar.text_input("Artifact ZIP içi yol", value=GEOJSON_IN_ZIP_PATH_DEFAULT)
+
+    geojson = fetch_geojson_smart(
+        path_local=geojson_local,
+        path_in_zip=geojson_zip,
+        raw_owner=RAW_GEOJSON_OWNER,
+        raw_repo=RAW_GEOJSON_REPO,
     )
 
-
-# =========================
-# UI Akışı
-# =========================
-st.sidebar.header("GitHub Artifact")
-refresh = st.sidebar.button("Veriyi Yenile (artifact'i tazele)")
-
-try:
-    if refresh:
-        fetch_latest_artifact_zip.clear()
-        read_risk_from_artifact.clear()
-        fetch_geojson_smart.clear()
-
-    risk_df = read_risk_from_artifact()
-except Exception as e:
-    st.error(f"Artifact indirilemedi/okunamadı: {e}")
-    st.stop()
-
-risk_daily = daily_average(risk_df)
-dates = sorted(risk_daily["date"].unique())
-
-if dates:
-    sel_date = st.sidebar.selectbox("Gün seçin", dates, index=len(dates) - 1, format_func=str)
-else:
-    sel_date = None
-
-one_day = classify_quantiles(risk_daily, sel_date) if sel_date else pd.DataFrame()
-
-if not one_day.empty:
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Q25", f"{one_day['q25'].iloc[0]:.4f}")
-    c2.metric("Q50", f"{one_day['q50'].iloc[0]:.4f}")
-    c3.metric("Q75", f"{one_day['q75'].iloc[0]:.4f}")
-
-st.sidebar.header("Harita Sınırları (GeoJSON)")
-geojson_local = st.sidebar.text_input("Local yol", value=GEOJSON_PATH_LOCAL_DEFAULT)
-geojson_zip = st.sidebar.text_input("Artifact ZIP içi yol", value=GEOJSON_IN_ZIP_PATH_DEFAULT)
-
-geojson = fetch_geojson_smart(
-    path_local=geojson_local,
-    path_in_zip=geojson_zip,
-    raw_owner=RAW_GEOJSON_OWNER,
-    raw_repo=RAW_GEOJSON_REPO,
-)
-
-st.subheader(f"Harita — {sel_date if sel_date else 'Seçilmedi'}")
-if not geojson:
-    st.warning("GeoJSON bulunamadı (local/artifact/raw). Yolları kontrol edin.")
-else:
-    enriched = inject_properties(geojson, one_day) if not one_day.empty else geojson
-    make_map(enriched)
-
-with st.expander("Teşhis (Artifact İçeriği)"):
-    try:
-        zip_bytes = fetch_latest_artifact_zip(OWNER, REPO, ARTIFACT_NAME)
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            mem = zf.namelist()
-        st.write(
-            {
-                "artifact": f"{OWNER}/{REPO} → {ARTIFACT_NAME}.zip",
-                "zip_manifest_head": mem[:20],
-                "geojson_local": geojson_local,
-                "geojson_zip": geojson_zip,
-            }
+    if sel_date:
+        one_day = classify_quantiles(risk_daily, sel_date)
+        if not one_day.empty:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Q25", f"{one_day['q25'].iloc[0]:.4f}")
+            c2.metric("Q50", f"{one_day['q50'].iloc[0]:.4f}")
+            c3.metric("Q75", f"{one_day['q75'].iloc[0]:.4f}")
+        st.subheader(f"Harita — {sel_date}")
+        enriched = inject_properties(geojson, one_day) if (geojson and not one_day.empty) else geojson
+        if not geojson:
+            st.warning("GeoJSON bulunamadı (local/artifact/raw). Yolları kontrol edin.")
+        else:
+            make_map_home(enriched)
+        st.subheader("Seçilen Gün Tablosu")
+        table_df = one_day.drop(columns=["q25","q50","q75"], errors="ignore") if sel_date and not one_day.empty else pd.DataFrame()
+        st.dataframe(
+            table_df.sort_values("risk_score_daily", ascending=False) if not table_df.empty else table_df,
+            use_container_width=True,
         )
+        if not table_df.empty:
+            csv = table_df.to_csv(index=False).encode("utf-8")
+            st.download_button("Günlük tabloyu CSV indir", csv, file_name=f"risk_daily_{sel_date}.csv", mime="text/csv")
+    else:
+        st.info("Artifact içinde tarih bulunamadı. Forecast sekmesinden saatlik görünüme bakabilirsiniz.")
+
+# ---------- Forecast ----------
+with tabs[1]:
+    st.subheader("Saatlik Risk & E[olay] (Forecast)")
+    try:
+        risk_df = read_risk_from_artifact()
     except Exception as e:
-        st.write({"artifact_error": str(e)})
+        st.error(f"Artifact okunamadı: {e}")
+        st.stop()
 
-st.subheader("Seçilen Gün Tablosu")
-table_df = one_day.drop(columns=["q25", "q50", "q75"], errors="ignore") if not one_day.empty else pd.DataFrame()
-st.dataframe(
-    table_df.sort_values("risk_score_daily", ascending=False) if not table_df.empty else table_df,
-    use_container_width=True,
-)
+    # Saat / gün / sezon seçiciler
+    hours = sorted(risk_df.get("event_hour", pd.Series(range(24))).dropna().unique().tolist())
+    dows  = sorted(risk_df.get("day_of_week", pd.Series([0,1,2,3,4,5,6])).unique().tolist())
+    seasons = sorted(risk_df.get("season", pd.Series(["Winter","Spring","Summer","Fall"])).unique().tolist())
 
-if not table_df.empty:
-    csv = table_df.to_csv(index=False).encode("utf-8")
-    st.download_button("Günlük tabloyu CSV indir", csv, file_name=f"risk_daily_{sel_date}.csv", mime="text/csv")
+    c1,c2,c3 = st.columns(3)
+    sel_hour   = c1.select_slider("Saat", options=hours, value=hours[0] if hours else 0)
+    sel_dow    = c2.selectbox("Haftanın Günü (0=Mon ... 6=Sun)", options=dows, index=0)
+    sel_season = c3.selectbox("Sezon", options=seasons, index=0)
+
+    # Filtre
+    layer_df = risk_df.copy()
+    if "event_hour" in layer_df.columns: layer_df = layer_df[layer_df["event_hour"]==sel_hour]
+    if "day_of_week" in layer_df.columns: layer_df = layer_df[layer_df["day_of_week"]==sel_dow]
+    if "season" in layer_df.columns:      layer_df = layer_df[layer_df["season"]==sel_season]
+
+    # risk_score alias (garanti)
+    if "risk_score" not in layer_df.columns:
+        if "proba" in layer_df.columns:
+            layer_df["risk_score"] = layer_df["proba"].astype(float)
+        elif "risk" in layer_df.columns:
+            layer_df["risk_score"] = layer_df["risk"].astype(float)
+        else:
+            st.warning("risk_score/proba/risk kolonu bulunamadı.")
+            layer_df["risk_score"] = 0.0
+
+    # E[olay] = pred_expected (varsa) else proba × exposure_guess
+    if "pred_expected" not in layer_df.columns:
+        exp = load_exposure_fallback()
+        if not exp.empty and "hour_range" in layer_df.columns and "hour_range" in exp.columns:
+            layer_df = layer_df.merge(exp[["GEOID","hour_range","exposure_guess"]], on=["GEOID","hour_range"], how="left")
+        else:
+            exp_geo = exp.groupby("GEOID", as_index=False)["exposure_guess"].mean() if not exp.empty else pd.DataFrame(columns=["GEOID","exposure_guess"])
+            layer_df = layer_df.merge(exp_geo, on="GEOID", how="left")
+        layer_df["exposure_guess"] = layer_df["exposure_guess"].fillna(0.3)
+        layer_df["pred_expected"] = (layer_df["risk_score"] * layer_df["exposure_guess"]).round(2)
+
+    # GeoJSON
+    geojson = fetch_geojson_smart(
+        path_local=GEOJSON_PATH_LOCAL_DEFAULT,
+        path_in_zip=GEOJSON_IN_ZIP_PATH_DEFAULT,
+        raw_owner=RAW_GEOJSON_OWNER,
+        raw_repo=RAW_GEOJSON_REPO,
+    )
+
+    # Harita + Top-K
+    colL, colR = st.columns([3,1], gap="large")
+    with colL:
+        if geojson and not layer_df.empty:
+            make_map_forecast(geojson, layer_df.rename(columns=str.upper))  # tooltip GEOID için
+        else:
+            st.info("GeoJSON veya katman verisi yok.")
+
+    with colR:
+        st.markdown("**Kritik Top-K (E[olay])**")
+        topn = st.slider("Kayıt sayısı", 10, 200, 50)
+        cols_show = [c for c in ["GEOID","risk_score","pred_expected"] if c in layer_df.columns]
+        top = layer_df[cols_show].sort_values(["pred_expected","risk_score"], ascending=False).head(topn)
+        st.dataframe(top.reset_index(drop=True), use_container_width=True)
+        if not layer_df.empty:
+            q25,q50,q75 = layer_df["risk_score"].quantile([.25,.5,.75]).round(4)
+            st.caption(f"Q25={q25:.4f} • Q50={q50:.4f} • Q75={q75:.4f}")
+
+# ---------- Planning ----------
+with tabs[2]:
+    st.subheader("🚓 Devriye Planlama (yakında)")
+    st.info("Mevcut öneri motorunu buraya bağlayacağız: ekip sayısı, rota uzunluğu, dwell, çeşitlilik ayarı vs.")
+
+# ---------- Stats ----------
+with tabs[3]:
+    st.subheader("📊 Suç İstatistikleri (yakında)")
+    st.info("Saat/gün/ay dağılımları, gün×saat ısı haritası, tür dağılımları ve seçili GEOID detayları eklenecek.")
+
+# ---------- Reports ----------
+with tabs[4]:
+    st.subheader("🧾 Raporlar & Operasyonel Öneriler (yakında)")
+    st.info("Günlük/Haftalık/Aylık rapor üretimi + PDF/CSV indir düğmeleri burada olacak.")
