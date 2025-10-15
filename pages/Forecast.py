@@ -58,6 +58,38 @@ def fetch_latest_artifact_zip(owner: str, repo: str, artifact_name: str) -> byte
     r2.raise_for_status()
     return r2.content
 
+def _ensure_temporal_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # hour_range -> hour
+    if "hour" not in df.columns and "hour_range" in df.columns:
+        df["hour"] = pd.to_numeric(df["hour_range"], errors="coerce").fillna(0).astype(int).clip(0, 23)
+    elif "hour" not in df.columns:
+        df["hour"] = 0
+
+    # date -> dow (0=Mon..6=Sun)
+    if "dow" not in df.columns:
+        if "date" in df.columns:
+            t = pd.to_datetime(df["date"], errors="coerce")
+            df["dow"] = t.dt.dayofweek.fillna(0).astype(int)
+        else:
+            df["dow"] = 0
+
+    # date -> season (kaba etiket)
+    if "season" not in df.columns:
+        if "date" in df.columns:
+            month = pd.to_datetime(df["date"], errors="coerce").dt.month
+            season_map = {12:"Winter",1:"Winter",2:"Winter",3:"Spring",4:"Spring",5:"Spring",
+                          6:"Summer",7:"Summer",8:"Summer",9:"Fall",10:"Fall",11:"Fall"}
+            df["season"] = month.map(season_map).fillna("All").astype(str)
+        else:
+            df["season"] = "All"
+
+    df["hour"] = df["hour"].astype(int).clip(0, 23)
+    df["dow"]  = df["dow"].astype(int).clip(0, 6)
+    df["season"] = df["season"].astype(str)
+    return df
+
+
 @st.cache_data(show_spinner=True, ttl=15*60)
 def read_risk_from_artifact() -> pd.DataFrame:
     """
@@ -84,27 +116,7 @@ def read_risk_from_artifact() -> pd.DataFrame:
                 break
     df["geoid"] = df["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
 
-    # hour/dow/season türetmeleri
-    # varsa timestamp/datetime'ten çek
-    ts_col = None
-    for cand in ["ts", "timestamp", "datetime"]:
-        if cand in df.columns:
-            ts_col = cand
-            break
-    if ts_col is not None:
-        t = pd.to_datetime(df[ts_col], errors="coerce", utc=True).dt.tz_convert("US/Pacific")
-        df["hour"] = df.get("hour", t.dt.hour)
-        df["dow"] = df.get("dow", t.dt.dayofweek)
-        # season kaba etiket
-        month = t.dt.month
-        season_map = {12:"Winter",1:"Winter",2:"Winter",3:"Spring",4:"Spring",5:"Spring",
-                      6:"Summer",7:"Summer",8:"Summer",9:"Fall",10:"Fall",11:"Fall"}
-        df["season"] = df.get("season", month.map(season_map))
-    else:
-        # alternatif kolon isimleri
-        for src, dst in [("hour_of_day","hour"), ("weekday","dow")]:
-            if src in df.columns and dst not in df.columns:
-                df[dst] = df[src]
+    df = _ensure_temporal_cols(df)
 
     # risk kolonunu aliasla (artifact'a göre değişebiliyor: proba / risk)
     if "risk_score" not in df.columns:
@@ -113,18 +125,12 @@ def read_risk_from_artifact() -> pd.DataFrame:
         elif "risk" in df.columns:
             df = df.rename(columns={"risk": "risk_score"})
 
-    # güvenlik: gerekli kolonlar
-    need = {"geoid","hour","dow","season","risk_score"}
+    # en azından bu alanlar garanti olsun
+    need = {"geoid", "hour", "dow", "season", "risk_score"}
     miss = need - set(df.columns)
     if miss:
         raise ValueError(f"Eksik kolon(lar): {', '.join(sorted(miss))}")
 
-    # tipler
-    df["hour"] = df["hour"].astype(int).clip(0,23)
-    df["dow"]  = df["dow"].astype(int).clip(0,6)
-    df["season"] = df["season"].astype(str)
-
-    return df
 
 @st.cache_data(ttl=60*60, show_spinner=False)
 def fetch_geojson_smart(path_local: str, path_in_zip: str, raw_owner: str, raw_repo: str) -> dict:
@@ -161,49 +167,69 @@ def fetch_geojson_smart(path_local: str, path_in_zip: str, raw_owner: str, raw_r
 # -------------------------
 @st.cache_data(ttl=30*60, show_spinner=False)
 def load_exposure_fallback() -> pd.DataFrame:
-    """
-    risk_hourly.parquet içinde 'pred_expected' yoksa
-    saatlik beklenen olay için sf_crime_09.csv'den yaklaşık 'exposure_guess' üret:
-    crime_last_7d / 7 (min 0.1). hour_range yoksa tüm saatlere uygula.
-    """
     try:
         c9 = pd.read_csv(RAW_C09)
         if "GEOID" not in c9.columns:
-            return pd.DataFrame(columns=["geoid","hour","exposure_guess"])
+            return pd.DataFrame(columns=["geoid","season","day_of_week","event_hour","exposure_guess"])
         c9["geoid"] = c9["GEOID"].astype(str).str.replace(r"\D","",regex=True).str.zfill(11)
-        if "hour_range" in c9.columns:
-            # hour_range 0-23 kabul edilerek
-            c9["hour"] = pd.to_numeric(c9["hour_range"], errors="coerce").fillna(0).astype(int).clip(0,23)
-        else:
-            c9 = c9.assign(hour=-1)  # -1 -> tüm saatler
-        base = (c9.get("crime_last_7d", 0) / 7.0).clip(lower=0.1)
-        c9["exposure_guess"] = base
-        return c9[["geoid","hour","exposure_guess"]]
+
+        # crime_last_7d varsa saatlik taban ~ /7
+        base = (pd.to_numeric(c9.get("crime_last_7d", 0), errors="coerce") / 7.0).clip(lower=0.1)
+        c9["exposure_guess"] = base.fillna(0.1)
+
+        # sadece gerekli kolonlar
+        keep = ["geoid","season","day_of_week","event_hour","exposure_guess"]
+        return c9[[k for k in keep if k in c9.columns]].copy()
     except Exception:
-        return pd.DataFrame(columns=["geoid","hour","exposure_guess"])
+        return pd.DataFrame(columns=["geoid","season","day_of_week","event_hour","exposure_guess"])
 
 def attach_pred_expected(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    'pred_expected' yoksa risk_score * exposure_guess ile tahmin et.
-    """
     if "pred_expected" in df.columns:
         return df
+
     expo = load_exposure_fallback()
     if expo.empty:
         st.warning("Exposure kaynağı yüklenemedi → geçici 0.3 tabanı kullanılıyor.")
-        df = df.copy()
-        df["pred_expected"] = (df["risk_score"] * 0.3).round(3)
-        return df
-    # saat eşleşmesi (hour==-1 tüm saatlere uygula)
-    df = df.copy()
-    left = df.merge(expo[expo["hour"]!=-1], on=["geoid","hour"], how="left")
-    if left["exposure_guess"].isna().all():
-        # sadece hour==-1 varsa
-        left = df.merge(expo[expo["hour"]==-1][["geoid","exposure_guess"]], on="geoid", how="left")
-    left["exposure_guess"] = left["exposure_guess"].fillna(0.3)
-    left["pred_expected"] = (left["risk_score"] * left["exposure_guess"]).round(3)
-    return left
+        out = df.copy()
+        out["pred_expected"] = (out["risk_score"] * 0.3).round(3)
+        return out
 
+    out = df.copy()
+    expo = expo.copy()
+    expo["day_of_week"] = pd.to_numeric(expo["day_of_week"], errors="coerce").fillna(0).astype(int)
+    expo["event_hour"]  = pd.to_numeric(expo["event_hour"],  errors="coerce").fillna(0).astype(int)
+    expo["season"] = expo["season"].astype(str)
+
+    # 1) tam eşleşme: geoid + season + dow + hour  (dow = day_of_week, hour = event_hour)
+    m = out.merge(
+        expo,
+        left_on=["geoid","season","dow","hour"],
+        right_on=["geoid","season","day_of_week","event_hour"],
+        how="left"
+    )
+
+    # 2) olmadıysa: geoid + hour
+    miss = m["exposure_guess"].isna()
+    if miss.any():
+        m.loc[miss, "exposure_guess"] = out.merge(
+            expo[["geoid","event_hour","exposure_guess"]],
+            left_on=["geoid","hour"],
+            right_on=["geoid","event_hour"],
+            how="left"
+        )["exposure_guess_y"]
+
+    # 3) olmadıysa: geoid ortalaması
+    miss = m["exposure_guess"].isna()
+    if miss.any():
+        ge_mean = expo.groupby("geoid", as_index=False)["exposure_guess"].mean()
+        m.loc[miss, "exposure_guess"] = out.merge(
+            ge_mean, on="geoid", how="left"
+        )["exposure_guess_y"]
+
+    m["exposure_guess"] = m["exposure_guess"].fillna(0.3)
+    m["pred_expected"] = (m["risk_score"] * m["exposure_guess"]).round(3)
+    return m
+    
 # -------------------------
 # Harita çizimi
 # -------------------------
