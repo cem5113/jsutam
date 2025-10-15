@@ -53,7 +53,7 @@ RAW_GEOJSON_REPO  = "crimepredict"
 GITHUB_TOKEN = st.secrets.get("github_token", os.environ.get("GITHUB_TOKEN", ""))
 
 st.set_page_config(page_title="🧭 Suç Tahmini (Forecast)", layout="wide")
-
+now = datetime.now() 
 
 # =========================
 # Yardımcılar — IO
@@ -455,6 +455,8 @@ with st.sidebar:
         time_label = f"{base_date} +7g — gün {day_index} ({pick})"
 
     refresh = st.button("Veriyi Yenile")
+    if refresh:
+        now = datetime.now() 
 
     st.divider()
     st.subheader("Harita sınırları")
