@@ -146,20 +146,37 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _ensure_ts_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """date + hour'dan zaman damgası (ts) ve haftanın günü (dow) üretir."""
+    """
+    date + hour'dan zaman damgası (ts) ve haftanın günü (dow) üretir.
+    hour yoksa hour_from / hour_range'tan türetir.
+    """
     df = df.copy()
-    if "hour" not in df.columns and "hour_from" in df.columns:
-        df["hour"] = pd.to_numeric(df["hour_from"], errors="coerce").fillna(0).astype(int).clip(0, 23)
-    else:
-        df["hour"] = pd.to_numeric(df.get("hour", 0), errors="coerce").fillna(0).astype(int).clip(0, 23)
 
+    # --- HOUR alanını güvenle oluştur ---
+    if "hour" in df.columns:
+        df["hour"] = pd.to_numeric(df["hour"], errors="coerce")
+    elif "hour_from" in df.columns:
+        df["hour"] = pd.to_numeric(df["hour_from"], errors="coerce")
+    elif "hour_range" in df.columns:
+        # "18-20" -> 18
+        hr0 = df["hour_range"].astype(str).str.extract(r"(\d{1,2})")[0]
+        df["hour"] = pd.to_numeric(hr0, errors="coerce")
+    else:
+        df["hour"] = np.nan
+
+    df["hour"] = df["hour"].fillna(0).astype(int).clip(0, 23)
+
+    # --- DATE alanını güvenle datetime64'e çevir ---
     if "date" not in df.columns:
         raise ValueError("Forecast için 'date' sütunu gerekli (yyyy-mm-dd).")
 
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    df["ts"] = sdt + pd.to_timedelta(df["hour"], unit="h")
+    # Not: _normalize_cols() içinde .dt.date yapılmış olabilir; yine de güvenli dönüştür.
     sdt = pd.to_datetime(df["date"], errors="coerce")
-    df["dow"] = sdt.dt.weekday
+
+    # --- ts ve dow üret ---
+    df["ts"] = sdt + pd.to_timedelta(df["hour"], unit="h")
+    df["dow"] = sdt.dt.weekday  # 0=Mon ... 6=Sun
+
     return df
 
 def build_naive_forecast(df_hist: pd.DataFrame, start_dt: datetime, end_dt: datetime, k_weeks: int = 4) -> pd.DataFrame:
