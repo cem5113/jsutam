@@ -130,7 +130,7 @@ def read_risk_from_artifact() -> pd.DataFrame:
     miss = need - set(df.columns)
     if miss:
         raise ValueError(f"Eksik kolon(lar): {', '.join(sorted(miss))}")
-    return d
+    return df
 
 @st.cache_data(ttl=60*60, show_spinner=False)
 def fetch_geojson_smart(path_local: str, path_in_zip: str, raw_owner: str, raw_repo: str) -> dict:
