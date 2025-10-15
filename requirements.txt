@@ -1,7 +1,14 @@
-streamlit>=1.37
-pandas>=2.2
+# Temel bilimsel yığın (Streamlit Cloud ile uyumlu sürümler)
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.11.4
+
+# ML
+scikit-learn==1.5.2
+joblib>=1.3
+threadpoolctl>=3.1
+
+# Uygulama
+streamlit>=1.34
+pydeck>=0.9.1
 requests>=2.31
-pydeck>=0.8
-folium>=0.16.0
-streamlit-folium>=0.21.0
-branca>=0.7.2
