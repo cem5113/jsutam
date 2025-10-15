@@ -438,31 +438,29 @@ with st.sidebar:
     today = date.today()
     base_date = st.date_input("Tarih", value=today)
 
-    # Kontrolleri ufka göre göster
-    if horizon == "Anlık (şimdi)":
-        sl = slice_24h(risk, now.date(), now.hour)
-        time_label = f"Anlık — {now.strftime('%Y-%m-%d %H:00')}"
-    elif "24 saat" in horizon:
-        sl = slice_24h(risk, base_date, hour_sel)
-        time_label = f"{base_date} — {hour_sel:02d}:00"
+    if "24 saat" in horizon:
+        hour_sel = st.slider("Saat", 0, 23, now.hour)
     elif "72 saat" in horizon:
-        start_dt = datetime.combine(base_date, datetime.min.time()).replace(hour=start_hour)
-        sl, bins_labels = slice_72h_bins(risk, start_dt, bin_index)
-        time_label = f"{base_date} +72h — blok {bin_index} ({bins_labels[bin_index]})"
-    else:
-        sl, days_labels = slice_weekly(risk, base_date, day_index)
-        pick = days_labels[day_index] if days_labels else str(base_date)
-        time_label = f"{base_date} +7g — gün {day_index} ({pick})"
+        start_hour = st.slider("Başlangıç saati (72h)", 0, 23, now.hour)
+        bin_index = st.selectbox(
+            "Gösterilecek 3s blok (0..23)",
+            list(range(24)),
+            index=(now.hour // 3),
+            format_func=lambda i: f"{i*3:02d}-{i*3+2:02d}",
+        )
+    elif "1 hafta" in horizon:
+        day_index = st.selectbox("Gösterilecek gün (0..6)", list(range(7)), index=0)
 
     refresh = st.button("Veriyi Yenile")
     if refresh:
-        now = datetime.now() 
+        now = datetime.now()
 
     st.divider()
     st.subheader("Harita sınırları")
     geojson_local = st.text_input("Local yol", value=GEOJSON_PATH_LOCAL_DEFAULT)
     geojson_zip   = st.text_input("Artifact ZIP içi yol", value=GEOJSON_IN_ZIP_PATH_DEFAULT)
 
+# veri oku
 # veri oku
 try:
     if refresh:
@@ -477,7 +475,7 @@ except Exception as e:
 
 risk = ensure_pred_expected(risk)
 
-# kategori filtresi (varsa)
+# kategori filtresi
 cand_cols = [c for c in ["offense","offense_category","crime_type","primary_type"] if c in risk.columns]
 with st.sidebar:
     if cand_cols:
@@ -491,17 +489,25 @@ with st.sidebar:
 if chosen:
     risk = risk[risk[cat_col].astype(str).isin(chosen)].copy()
 
-# slice
-if "24 saat" in horizon:
+hour_sel = locals().get("hour_sel", now.hour)
+start_hour = locals().get("start_hour", now.hour)
+day_index = locals().get("day_index", 0)
+bin_index = locals().get("bin_index", 0)
+
+if horizon == "Anlık (şimdi)":
+    sl = slice_24h(risk, now.date(), now.hour)
+    time_label = f"Anlık — {now.strftime('%Y-%m-%d %H:00')}"
+elif "24 saat" in horizon:
     sl = slice_24h(risk, base_date, hour_sel)
     time_label = f"{base_date} — {hour_sel:02d}:00"
 elif "72 saat" in horizon:
     start_dt = datetime.combine(base_date, datetime.min.time()).replace(hour=start_hour)
     sl, bins_labels = slice_72h_bins(risk, start_dt, bin_index)
-    time_label = f"{base_date} +72h — blok {bins_labels[bin_index]}"
+    time_label = f"{base_date} +72h — blok {bin_index} ({bins_labels[bin_index]})"
 else:
     sl, days_labels = slice_weekly(risk, base_date, day_index)
-    time_label = f"{base_date} +7g — gün {day_index} ({days_labels[day_index] if days_labels else ''})"
+    pick = days_labels[day_index] if days_labels else str(base_date)
+    time_label = f"{base_date} +7g — gün {day_index} ({pick})"
 
 if sl.empty:
     st.warning("Seçili aralıkta veri bulunamadı.")
