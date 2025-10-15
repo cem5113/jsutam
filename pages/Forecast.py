@@ -348,16 +348,17 @@ def make_priority_color(priority: str) -> str:
     return cmap.get(priority, "#CCCCCC")
 
 def render_map(geojson: dict, slice_df: pd.DataFrame, value_col: str = "pred_expected") -> Tuple[folium.Map, Dict[str, Tuple[float,float]]]:
-    geojson_enriched = enrich_geojson_with_slice(geojson, sl, top3)
-    geojson_enriched = sanitize_props(geojson_enriched)  # <- burada
-    folium_map, centroids = render_map(geojson_enriched, sl, value_col="pred_expected")
+    # JSON serileştirme için temizle (NaN, numpy tipleri, Timestamp -> safe)
+    geojson = sanitize_props(geojson)
+
     # merkez SF
     m = folium.Map(location=[37.7749, -122.4194], zoom_start=12, tiles="cartodbpositron")
+
     # Heatmap: centroids + intensity
     centroids = geojson_centroids(geojson)
     heat_pts = []
     for _, row in slice_df.iterrows():
-        g = row["geoid"]
+        g = str(row["geoid"])
         val = float(row.get(value_col, 0.0))
         if g in centroids and val > 0:
             lat, lon = centroids[g]
@@ -365,35 +366,38 @@ def render_map(geojson: dict, slice_df: pd.DataFrame, value_col: str = "pred_exp
     if heat_pts:
         HeatMap(heat_pts, name="E[olay] ısı", radius=25, blur=20, max_zoom=13).add_to(m)
 
-    # Choropleth + tooltip
+    # Choropleth + tooltip/popup
     def style_func(feat):
         p = (feat.get("properties") or {})
-        col = make_priority_color(str(p.get("priority","zero")))
+        col = make_priority_color(str(p.get("priority", "zero")))
         return {"fillColor": col, "color": "#555555", "weight": 0.5, "fillOpacity": 0.55}
 
+    # Tüm feature'larda bu alanlar olduğundan emin olduğumuz için fields sabit
     tooltip = folium.features.GeoJsonTooltip(
-        fields=["geoid","pred_expected","priority"],
+        fields=["geoid", "pred_expected", "priority"],
         aliases=["GEOID", "E[olay] (toplam)", "Öncelik"],
         localize=True,
         sticky=False,
         labels=True,
     )
     popup = folium.features.GeoJsonPopup(
-        fields=["geoid","pred_expected","priority","top3"],
-        aliases=["GEOID","E[olay] (toplam)","Öncelik","En olası 3 suç"],
+        fields=["geoid", "pred_expected", "priority", "top3"],
+        aliases=["GEOID", "E[olay] (toplam)", "Öncelik", "En olası 3 suç"],
         localize=True,
         labels=True,
         parse_html=False,
         sticky=False,
         max_width=350,
     )
+
     folium.GeoJson(
         geojson,
         name="Öncelik (choropleth)",
         style_function=style_func,
         tooltip=tooltip,
-        popup=popup
+        popup=popup,
     ).add_to(m)
+
     folium.LayerControl(collapsed=True).add_to(m)
     return m, centroids
 
@@ -481,6 +485,7 @@ if not geojson:
 # enrich + harita
 geojson_enriched = enrich_geojson_with_slice(geojson, sl, top3)
 folium_map, centroids = render_map(geojson_enriched, sl, value_col="pred_expected")
+mres = st_folium(folium_map, width=None, height=600, use_container_width=True)
 
 st.subheader(f"Harita — {time_label}")
 mres = st_folium(folium_map, width=None, height=600, use_container_width=True)
