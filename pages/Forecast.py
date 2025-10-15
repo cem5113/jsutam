@@ -13,7 +13,7 @@ OWNER = "cem5113"
 REPO = "crime_prediction_data"
 ARTIFACT_NAME = "sf-crime-parquet"
 EXPECTED_PARQUET = "risk_hourly.parquet"
-EXPECTED_C09 = "sf_crime_09.csv"
+EXPECTED_C09 = "sf_crime_09.parquet"
 
 GEOJSON_PATH_LOCAL_DEFAULT = "data/sf_cells.geojson"
 GEOJSON_IN_ZIP_PATH_DEFAULT = "data/sf_cells.geojson"
@@ -21,7 +21,7 @@ GEOJSON_IN_ZIP_PATH_DEFAULT = "data/sf_cells.geojson"
 RAW_GEOJSON_OWNER = "cem5113"
 RAW_GEOJSON_REPO  = "crimepredict"
 
-RAW_C09 = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/sf_crime_09.csv"
+RAW_C09 = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/sf_crime_09.parquet"
 
 GITHUB_TOKEN = st.secrets.get("github_token", os.environ.get("GITHUB_TOKEN", ""))
 
@@ -166,7 +166,7 @@ def fetch_geojson_smart(path_local: str, path_in_zip: str, raw_owner: str, raw_r
 @st.cache_data(show_spinner=True, ttl=15*60)
 def read_c09_from_artifact() -> pd.DataFrame:
     """
-    Aynı artifact ZIP içinden sf_crime_09.csv'yi bulup okur.
+    Aynı artifact ZIP içinden sf_crime_09.parquet'yi bulup okur.
     """
     zip_bytes = fetch_latest_artifact_zip(OWNER, REPO, ARTIFACT_NAME)
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
@@ -176,7 +176,7 @@ def read_c09_from_artifact() -> pd.DataFrame:
         if not candidates:
             raise FileNotFoundError(f"Zip içinde {EXPECTED_C09} yok. Örnek içerik: {memlist[:12]}")
         with zf.open(candidates[0]) as f:
-            c9 = pd.read_csv(f)
+            c9 = pd.read_parquet(f)
 
     # kolon adlarını normalize et
     cols_l = {c: c.strip() for c in c9.columns}
@@ -204,13 +204,13 @@ def read_c09_from_artifact() -> pd.DataFrame:
     return c9
 
 # -------------------------
-# Exposure fallback (sf_crime_09.csv)
+# Exposure fallback (sf_crime_09.parquet)
 # -------------------------
 @st.cache_data(ttl=30*60, show_spinner=False)
 @st.cache_data(ttl=30*60, show_spinner=False)
 def load_exposure_fallback() -> pd.DataFrame:
     """
-    Önce artifact ZIP içinden sf_crime_09.csv'yi okumayı dener.
+    Önce artifact ZIP içinden sf_crime_09.parquet'yi okumayı dener.
     Olmazsa (isteğe bağlı) RAW_C09 URL'ine düşer.
     Çıktı: ['geoid','season','day_of_week','event_hour','exposure_guess']
     """
@@ -226,7 +226,7 @@ def load_exposure_fallback() -> pd.DataFrame:
             r = requests.get(RAW_C09, timeout=20)
             if r.status_code == 200:
                 import io as _io
-                c9 = pd.read_csv(_io.BytesIO(r.content))
+                c9 = pd.read_parquet(_io.BytesIO(r.content))
         except Exception:
             pass
 
@@ -423,7 +423,7 @@ try:
             st.write("sf_crime_09 HTTP:", _r.status_code, RAW_C09)
             if _r.status_code == 200:
                 import io as _io
-                _preview = pd.read_csv(_io.BytesIO(_r.content), nrows=5)
+                _preview = pd.read_parquet(_io.BytesIO(_r.content), nrows=5)
                 st.write("sf_crime_09 örnek:", _preview.shape, list(_preview.columns))
             else:
                 st.code(_r.text[:500])
@@ -569,13 +569,13 @@ if sel.empty:
 else:
     top_df = sel.nlargest(topk, columns=["pred_expected"])[["geoid","risk_score","pred_expected"]]
     st.dataframe(top_df.reset_index(drop=True), use_container_width=True)
-    csv = top_df.to_csv(index=False).encode("utf-8")
-    st.download_button("Top-K CSV indir", csv, file_name=f"forecast_topk_h{hour}_d{dow}_{season}.csv", mime="text/csv")
+    parquet = top_df.to_patquet(index=False).encode("utf-8")
+    st.download_button("Top-K PARQUET indir", parquet, file_name=f"forecast_topk_h{hour}_d{dow}_{season}.parquet", mime="text/parquet")
 
 # Alt notlar
 with st.expander("Notlar"):
     st.markdown(
         "- `risk_score`: modelin saatlik olasılık/tahmin skorudur.\n"
         "- `E[olay] (pred_expected)`: **risk_score × exposure_guess** (artifact'ta yoksa) ile yaklaşık beklenen olay sayısıdır.\n"
-        "- Exposure kaynağı `sf_crime_09.csv`; bulunamazsa 0.3 tabanı kullanılır."
+        "- Exposure kaynağı `sf_crime_09.parquet`; bulunamazsa 0.3 tabanı kullanılır."
     )
