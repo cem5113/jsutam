@@ -1,55 +1,103 @@
 # pages/Forecast.py
-import streamlit as st
-import pandas as pd
-import pydeck as pdk
 import json
 from urllib.request import urlopen
+
+import pandas as pd
+import pydeck as pdk
+import streamlit as st
 
 st.set_page_config(page_title="Suç Tahmini (Forecast)", layout="wide")
 
 RAW = "https://raw.githubusercontent.com/cem5113/crime_prediction_data/main/crime_prediction_data"
-URL_RISK = f"{RAW}/risk_hourly.parquet"  # model çıktısı (ols. proba/pred_expected olabilir)
-URL_C09  = f"{RAW}/sf_crime_09.csv"      # exposure için fallback kaynak
+URL_RISK = f"{RAW}/risk_hourly.parquet"          # model çıktısı (proba / pred_expected olabilir)
+URL_C09  = f"{RAW}/sf_crime_09.csv"              # exposure fallback kaynağı
 URL_GEO  = f"{RAW}/sf_census_blocks_with_population.geojson"
 
-@st.cache_data(ttl=15*60)
-def load_risk():
+# ---------------------------
+# Helpers
+# ---------------------------
+def _norm_geoid(series: pd.Series) -> pd.Series:
+    """Rakam dışını at, 11 haneye sıfır doldur."""
+    return (
+        series.astype(str)
+        .str.replace(r"\D", "", regex=True)
+        .str.zfill(11)
+        .str[:11]
+    )
+
+@st.cache_data(ttl=15 * 60)
+def load_risk() -> pd.DataFrame:
     df = pd.read_parquet(URL_RISK)
+    # kolonları normalize et
+    df.columns = [c.strip().lower() for c in df.columns]
+
     # GEOID normalize
-    df["GEOID"] = df["GEOID"].astype(str).str.extract(r"(\d+)").fillna("").str[:10]
-    # Bazı artifact sürümlerinde 'date' olmayabilir; sorun değil
+    if "geoid" not in df.columns:
+        for alt in ["cell_id", "geoid10", "geoid11", "geoid_10", "geoid_11", "id"]:
+            if alt in df.columns:
+                df["geoid"] = df[alt]
+                break
+    df["geoid"] = _norm_geoid(df["geoid"])
+
+    # proba/risk_score alias — 0/1 kolonları ele
+    prob_candidates = [c for c in ["proba", "risk_score", "score", "p", "prob"] if c in df.columns]
+    risk_col = None
+    for c in prob_candidates:
+        s = pd.to_numeric(df[c], errors="coerce")
+        uniq = set(s.dropna().unique())
+        if not uniq.issubset({0.0, 1.0}):  # ikili ise olasılık değildir
+            risk_col = c
+            break
+    if risk_col is None:
+        # son çare: varsa proba, yoksa sıfırla
+        risk_col = "proba" if "proba" in df.columns else None
+    if risk_col is None:
+        df["risk_score"] = 0.0
+    else:
+        df["risk_score"] = pd.to_numeric(df[risk_col], errors="coerce").fillna(0.0)
+
+    # tarih alanı varsa
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+
     return df
 
-@st.cache_data(ttl=24*60*60)
-def load_geojson():
+@st.cache_data(ttl=24 * 60 * 60)
+def load_geojson() -> dict:
     with urlopen(URL_GEO) as f:
         gj = json.load(f)
-    for ft in gj["features"]:
-        ft["properties"]["GEOID"] = str(ft["properties"].get("GEOID", ""))[:10]
+    for ft in gj.get("features", []):
+        props = ft.get("properties", {})
+        # normalize et ve properties'te tut
+        props["GEOID"] = _norm_geoid(pd.Series([props.get("GEOID", props.get("geoid", ""))])).iloc[0]
+        ft["properties"] = props
     return gj
 
-@st.cache_data(ttl=30*60)
-def load_exposure_fallback():
+@st.cache_data(ttl=30 * 60)
+def load_exposure_fallback() -> pd.DataFrame:
     """
     risk_hourly.parquet içinde pred_expected yoksa
-    saat başına 'exposure' tahmini için sf_crime_09.csv'den türet.
-    Mantık: crime_last_7d'i saatlik ölçeğe indir (≈ / 7) ve taban minimum ver.
+    saatlik exposure için sf_crime_09.csv'den tahmin üret.
+    Mantık: exposure ≈ crime_last_7d / 7  (en az 0.1)
     """
     try:
         c9 = pd.read_csv(URL_C09)
-        # normalize
-        if "GEOID" not in c9.columns:
-            # bazı sürümlerde geoid int olabilir
-            c9["GEOID"] = c9["GEOID"].astype(str).str.extract(r"(\d+)").fillna("").str[:10]
-        c9["exposure_guess"] = (c9.get("crime_last_7d", 0) / 7.0).clip(lower=0.1)
-        return c9[["GEOID", "hour_range", "exposure_guess"]]
+        # GEOID normalize
+        geocol = "GEOID" if "GEOID" in c9.columns else ("geoid" if "geoid" in c9.columns else None)
+        if geocol is None:
+            return pd.DataFrame(columns=["geoid", "hour_range", "exposure_guess"])
+        c9["geoid"] = _norm_geoid(c9[geocol])
+        # exposure
+        base = pd.to_numeric(c9.get("crime_last_7d", 0), errors="coerce").fillna(0.0)
+        c9["exposure_guess"] = (base / 7.0).clip(lower=0.1)
+        keep = ["geoid", "hour_range", "exposure_guess"]
+        return c9[[c for c in keep if c in c9.columns]]
     except Exception:
-        # tamamen yoksa şehir geneli sabit min
-        return pd.DataFrame(columns=["GEOID","hour_range","exposure_guess"])
+        return pd.DataFrame(columns=["geoid", "hour_range", "exposure_guess"])
 
-def color_layer(geojson, df_layer):
-    dmap = df_layer.set_index("GEOID")["proba"].to_dict()
-    qs = df_layer["proba"].quantile([0,.25,.5,.75,1]).tolist()
+def color_layer(geojson: dict, df_layer: pd.DataFrame):
+    dmap = df_layer.set_index("geoid")["risk_score"].to_dict()
+    qs = df_layer["risk_score"].quantile([0, .25, .5, .75, 1]).tolist()
     return pdk.Layer(
         "GeoJsonLayer",
         geojson,
@@ -58,67 +106,72 @@ def color_layer(geojson, df_layer):
         pickable=True,
         get_fill_color={
             "function": """
-            const M=Object.fromEntries(py_dmap);
-            const Q=py_qs;
-            return (f)=>{
-              const g=String(f.properties.GEOID||"").slice(0,10);
-              const p=(M[g]===undefined)?0:M[g];
-              if (p<=Q[1]) return [178,223,138,220];   // low
-              if (p<=Q[2]) return [255,255,178,220];   // medium
-              if (p<=Q[3]) return [254,204,92,230];    // high
+            const M = Object.fromEntries(py_dmap), Q = py_qs;
+            return (f) => {
+              const g = String(f.properties.GEOID || "").replace(/\\D/g,"").padStart(11,"0").slice(0,11);
+              const p = (M[g]===undefined) ? 0 : M[g];
+              if (p <= Q[1]) return [178,223,138,220];  // low
+              if (p <= Q[2]) return [255,255,178,220];  // medium
+              if (p <= Q[3]) return [254,204,92,230];   // high
               return [227,26,28,235];                  // critical
-            }
+            };
             """
         },
         parameters={"py_dmap": list(dmap.items()), "py_qs": qs},
     )
 
+# ---------------------------
+# UI
+# ---------------------------
 st.title("🧭 Suç Tahmini (Forecast)")
-colL, colR = st.columns([3,1], gap="large")
+colL, colR = st.columns([3, 1], gap="large")
 
-# --- Kontroller ---
 with colR:
     df_risk = load_risk()
-    hours = sorted(df_risk["event_hour"].dropna().unique().tolist())
-    dows  = sorted(df_risk.get("day_of_week", pd.Series([0,1,2,3,4,5,6])).unique().tolist())
-    seasons = sorted(df_risk.get("season", pd.Series(["Winter","Spring","Summer","Fall"])).unique().tolist())
+    hours   = sorted(df_risk.get("event_hour", pd.Series(range(24))).dropna().unique().tolist())
+    dows    = sorted(df_risk.get("day_of_week", pd.Series([0,1,2,3,4,5,6])).dropna().unique().tolist())
+    seasons = sorted(df_risk.get("season", pd.Series(["Winter","Spring","Summer","Fall"])).dropna().unique().tolist())
 
-    sel_hour   = st.select_slider("Saat", options=hours, value=hours[0])
+    sel_hour   = st.select_slider("Saat", options=hours, value=hours[0] if hours else 0)
     sel_dow    = st.selectbox("Haftanın Günü (0=Mon ... 6=Sun)", options=dows, index=0)
     sel_season = st.selectbox("Sezon", options=seasons, index=0)
-    topn = st.slider("Top-K (kritik liste)", 10, 200, 50)
+    topn       = st.slider("Top-K (kritik liste)", 10, 200, 50)
 
-# --- Filtre & E[olay] hesap ---
-mask = (df_risk["event_hour"]==sel_hour)
-if "day_of_week" in df_risk.columns: mask &= (df_risk["day_of_week"]==sel_dow)
-if "season" in df_risk.columns:      mask &= (df_risk["season"]==sel_season)
+# Filtre
+mask = pd.Series(True, index=df_risk.index)
+if "event_hour" in df_risk.columns: mask &= (df_risk["event_hour"] == sel_hour)
+if "day_of_week" in df_risk.columns: mask &= (df_risk["day_of_week"] == sel_dow)
+if "season" in df_risk.columns:      mask &= (df_risk["season"] == sel_season)
 layer_df = df_risk.loc[mask].copy()
 
-# 1) proba zaten modelden geliyor
-layer_df["proba"] = layer_df["proba"].astype(float)
-
-# 2) E[olay] (pred_expected)
-if "pred_expected" in layer_df.columns:
-    # artifact zaten hesaplamışsa direkt kullan
-    layer_df["pred_expected"] = layer_df["pred_expected"].astype(float)
-else:
-    # Yoksa exposure tahmin et (fallback)
+# E[olay] = pred_expected varsa kullan; yoksa risk_score × exposure_guess
+if "pred_expected" not in layer_df.columns:
     exp = load_exposure_fallback()
-    # hour_range eşleşmesi yoksa sadece GEOID ile eşle ve genel exposure kullan
-    if not exp.empty and "hour_range" in layer_df.columns and "hour_range" in exp.columns:
-        layer_df = layer_df.merge(exp[["GEOID","hour_range","exposure_guess"]],
-                                  on=["GEOID","hour_range"], how="left")
-    else:
-        # sadece GEOID ile (saatten bağımsız) eşle
-        exp_geo = exp.groupby("GEOID", as_index=False)["exposure_guess"].mean()
-        layer_df = layer_df.merge(exp_geo, on="GEOID", how="left")
-    layer_df["exposure_guess"] = layer_df["exposure_guess"].fillna(0.3)  # güvenli taban
-    layer_df["pred_expected"] = (layer_df["proba"] * layer_df["exposure_guess"]).round(2)
 
-# --- Harita ---
+    if exp.empty:
+        st.warning("Exposure kaynağı yüklenemedi → geçici 0.3 tabanı kullanılıyor.")
+        layer_df["exposure_guess"] = 0.3
+    else:
+        # merge anahtarı: geoid (+ varsa hour_range)
+        if ("hour_range" in layer_df.columns) and ("hour_range" in exp.columns):
+            layer_df = layer_df.merge(
+                exp[["geoid", "hour_range", "exposure_guess"]],
+                on=["geoid", "hour_range"], how="left"
+            )
+        else:
+            exp_geo = exp.groupby("geoid", as_index=False)["exposure_guess"].mean()
+            layer_df = layer_df.merge(exp_geo, on="geoid", how="left")
+
+        layer_df["exposure_guess"] = layer_df["exposure_guess"].fillna(0.3)
+
+    layer_df["pred_expected"] = (layer_df["risk_score"] * layer_df["exposure_guess"]).round(3)
+else:
+    layer_df["pred_expected"] = pd.to_numeric(layer_df["pred_expected"], errors="coerce").fillna(0.0).round(3)
+
+# Harita
 geojson = load_geojson()
-layer = color_layer(geojson, layer_df)
-view = pdk.ViewState(latitude=37.76, longitude=-122.44, zoom=11)
+layer   = color_layer(geojson, layer_df)
+view    = pdk.ViewState(latitude=37.76, longitude=-122.44, zoom=11)
 
 with colL:
     st.subheader("Risk Haritası (seçili saat)")
@@ -128,7 +181,7 @@ with colL:
         tooltip={
             "html": (
                 "<b>GEOID:</b> {GEOID}<br/>"
-                "<b>Risk (p):</b> {proba}<br/>"
+                "<b>Risk (p):</b> {risk_score}<br/>"
                 "<b>E[olay] (beklenen):</b> {pred_expected}"
             )
         }
@@ -136,9 +189,13 @@ with colL:
 
 with colR:
     st.markdown("**Kritik Top-K (E[olay] yüksek)**")
-    top = layer_df[["GEOID","proba","pred_expected"]].sort_values(
-        ["pred_expected","proba"], ascending=False
-    ).head(topn)
-    st.dataframe(top.reset_index(drop=True), use_container_width=True)
-    q25,q50,q75 = layer_df["proba"].quantile([.25,.5,.75]).round(4)
-    st.caption(f"Q25={q25:.4f} • Q50={q50:.4f} • Q75={q75:.4f}")
+    top = (
+        layer_df[["geoid", "risk_score", "pred_expected"]]
+        .sort_values(["pred_expected", "risk_score"], ascending=False)
+        .head(topn)
+        .reset_index(drop=True)
+    )
+    st.dataframe(top, use_container_width=True)
+    if not layer_df.empty:
+        q25, q50, q75 = layer_df["risk_score"].quantile([.25, .5, .75]).round(4)
+        st.caption(f"Q25={q25:.4f} • Q50={q50:.4f} • Q75={q75:.4f}")
