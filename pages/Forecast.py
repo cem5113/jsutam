@@ -348,15 +348,52 @@ try:
 
     with st.expander("🔎 Teşhis (geçici)"):
         st.write("risk_hourly:", base_df.shape, list(base_df.columns))
+        import traceback, textwrap, requests as _rq
         try:
-            c9_dbg = pd.read_csv(RAW_C09, nrows=5)
-            st.write("sf_crime_09 (örnek 5 satır):", c9_dbg.shape, list(c9_dbg.columns))
+            _r = _rq.get(RAW_C09, timeout=20)
+            st.write("sf_crime_09 HTTP:", _r.status_code, RAW_C09)
+            if _r.status_code == 200:
+                import io as _io
+                _preview = pd.read_csv(_io.BytesIO(_r.content), nrows=5)
+                st.write("sf_crime_09 örnek:", _preview.shape, list(_preview.columns))
+            else:
+                st.code(_r.text[:500])
         except Exception as e:
-            st.write("sf_crime_09 okunamadı:", e)
+            st.error("sf_crime_09 okunamadı (ayrıntı):")
+            st.code(textwrap.fill(str(e), 100))
+            st.code(textwrap.fill(traceback.format_exc(), 100))
             
 except Exception as e:
     st.error(f"Artifact indirilemedi/okunamadı: {e}")
     st.stop()
+
+def build_exposure_from_risk(risk_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    sf_crime_09 yoksa risk_hourly'den proxy exposure üret:
+      exposure_guess(geoid,hour) = mean(risk_score) scaled so city_mean ≈ 0.30
+    """
+    if risk_df.empty:
+        return pd.DataFrame(columns=["geoid","hour","exposure_guess"])
+
+    tmp = risk_df.copy()
+    # hour_range varsa hour'a çevir
+    if "hour" not in tmp.columns and "hour_range" in tmp.columns:
+        tmp["hour"] = pd.to_numeric(tmp["hour_range"], errors="coerce").fillna(0).astype(int).clip(0,23)
+
+    tmp["geoid"] = tmp["geoid"].astype(str).str.replace(r"\D","",regex=True).str.zfill(11)
+    tmp["hour"]  = pd.to_numeric(tmp["hour"], errors="coerce").fillna(0).astype(int)
+
+    agg = (
+        tmp.groupby(["geoid","hour"], as_index=False)["risk_score"]
+        .mean()
+        .rename(columns={"risk_score":"mean_risk"})
+    )
+
+    city_mean = float(agg["mean_risk"].mean()) if not agg.empty else 1.0
+    target = 0.30
+    scale = (target / city_mean) if city_mean > 1e-9 else 1.0
+    agg["exposure_guess"] = (agg["mean_risk"] * scale).clip(lower=0.05, upper=2.0)
+    return agg[["geoid","hour","exposure_guess"]]
 
 # pred_expected ekle
 df = attach_pred_expected(base_df)
