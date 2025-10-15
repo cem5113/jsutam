@@ -240,15 +240,31 @@ with st.sidebar:
             st.error(f"Artifact indirilemedi: {e}")
             st.stop()
 
-    parquet_names = []
-    try:
-        with zipfile.ZipFile(io.BytesIO(st.session_state["_art_zip"])) as zf:
-            parquet_names = [n for n in zf.namelist() if n.lower().endswith((".parquet",".pq",".parq"))]
-    except Exception as e:
-        st.error(f"ZIP açılamadı: {e}")
+    def _choose_history_parquet(zip_bytes: bytes) -> str:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = [n for n in zf.namelist() if n.lower().endswith((".parquet",".pq",".parq"))]
+        # 1) İsim önceliği (label içeren dosyalar)
+        priority = ["sf_crime_y.parquet"] + [f"sf_crime_{i:02d}.parquet" for i in range(1, 10)] + ["train.parquet","week.parquet","yarin.parquet"]
+        for p in priority:
+            for n in names:
+                if n.endswith("/"+p) or n.endswith(p):
+                    return n
+        # 2) Gürültülü dosyaları ele, ilk makul olanı al
+        bad = ("risk_hourly","metrics","pois","population","weather","bus","311","911","stops","neighbors")
+        for n in names:
+            base = os.path.basename(n).lower()
+            if any(b in base for b in bad):
+                continue
+            return n
+        # 3) En sona kalırsa yine de ilkini döndür (ama muhtemelen işe yaramaz)
+        return names[0] if names else ""
+    
+    zip_bytes = st.session_state.get("_art_zip")
+    artifact_file = _choose_history_parquet(zip_bytes)
+    if not artifact_file:
+        st.error("ZIP içinde Parquet dosyası bulunamadı.")
         st.stop()
-
-    artifact_file = st.selectbox("ZIP içinden Parquet seç", parquet_names, index=parquet_names.index("risk_hourly.parquet") if "risk_hourly.parquet" in parquet_names else 0)
+    st.caption(f"Kullanılan history: `{os.path.basename(artifact_file)}`")
 
     st.divider()
     st.header("Zaman & Ufuk")
@@ -287,17 +303,56 @@ def read_history_from_artifact(parquet_in_zip: str) -> pd.DataFrame:
 
 def normalize_history(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # datetime
+
+    # ---- datetime ----
+    # 1) doğrudan datetime/timestamp varsa onu kullan
     dtcol = None
     for c in df.columns:
-        if c.lower() in ["datetime","timestamp","time","date_time","dt"]:
+        lc = c.lower()
+        if lc in ["datetime","timestamp","time","date_time","dt"]:
             dtcol = c; break
-    if dtcol is None:
-        raise ValueError("datetime sütunu bulunamadı.")
-    df.rename(columns={dtcol:"datetime"}, inplace=True)
-    df["datetime"] = pd.to_datetime(df["datetime"])
 
-    # GEOID
+    if dtcol is not None:
+        df.rename(columns={dtcol:"datetime"}, inplace=True)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+    else:
+        # 2) date + hour veya hour_from +/− hour_range'den üret
+        # date
+        dcol = None
+        for c in df.columns:
+            if c.lower() == "date":
+                dcol = c; break
+        if dcol is None:
+            raise ValueError("datetime türetilemedi: 'date' veya 'datetime' bulunamadı.")
+
+        df["__date"] = pd.to_datetime(df[dcol]).dt.date
+
+        # hour
+        hcol = None
+        for c in df.columns:
+            if c.lower() == "hour":
+                hcol = c; break
+
+        if hcol is not None:
+            hh = pd.to_numeric(df[hcol], errors="coerce").fillna(0).astype(int).clip(0,23)
+        else:
+            # hour_from ya da hour_range ("18-20") → başlangıç saati
+            hf = None
+            for c in df.columns:
+                if c.lower() in ["hour_from","hourstart","hourrange","hour_range"]:
+                    hf = c; break
+            if hf is not None:
+                if hf.lower() in ["hour_range","hourrange"]:
+                    hh = df[hf].astype(str).str.extract(r"(\d{1,2})")[0].astype(float).fillna(0).astype(int).clip(0,23)
+                else:
+                    hh = pd.to_numeric(df[hf], errors="coerce").fillna(0).astype(int).clip(0,23)
+            else:
+                raise ValueError("datetime türetilemedi: 'hour' / 'hour_range' yok.")
+
+        df["datetime"] = pd.to_datetime(df["__date"]) + pd.to_timedelta(hh, unit="h")
+        df.drop(columns=["__date"], inplace=True)
+
+    # ---- GEOID ----
     gcol = None
     for c in df.columns:
         if c.lower() in ["geoid","cell_id","geoid10","geoid11","geoid_10","geoid_11","id"]:
@@ -307,17 +362,21 @@ def normalize_history(df: pd.DataFrame) -> pd.DataFrame:
     df.rename(columns={gcol:"GEOID"}, inplace=True)
     df["GEOID"] = df["GEOID"].astype(str).str.replace(r"\D","",regex=True).str.zfill(11)
 
-    # Y_label
+    # ---- Y_label ----
     ycol = None
     for c in df.columns:
-        if c in ["Y_label","y_label","label","y","target","crime"]:
+        if c in ["Y_label","y_label","label","y","target"]:
             ycol = c; break
     if ycol is None:
-        raise ValueError("Y_label (hedef) sütunu bulunamadı.")
+        raise ValueError("Y_label (hedef) sütunu bulunamadı (risk/proba dosyaları uygun değil).")
     if ycol != "Y_label":
         df.rename(columns={ycol:"Y_label"}, inplace=True)
     df["Y_label"] = pd.to_numeric(df["Y_label"], errors="coerce").fillna(0).astype(int).clip(0,1)
-    return df[["datetime","GEOID","Y_label"] + [c for c in df.columns if c not in ["datetime","GEOID","Y_label"]]]
+
+    # çıktı
+    keep_core = ["datetime","GEOID","Y_label"]
+    others = [c for c in df.columns if c not in keep_core]
+    return df[keep_core + others]
 
 def suggest_top_geoids(hist: pd.DataFrame, t0: pd.Timestamp, k: int = 200) -> List[str]:
     past = hist[hist["datetime"] < t0]
