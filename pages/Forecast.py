@@ -1,4 +1,5 @@
 # pages/Forecast.py
+
 import json
 from urllib.request import urlopen
 
@@ -27,7 +28,11 @@ def _norm_geoid(series: pd.Series) -> pd.Series:
 
 @st.cache_data(ttl=15 * 60)
 def load_risk() -> pd.DataFrame:
-    df = pd.read_parquet(URL_RISK)
+    # GitHub RAW'dan parquet'ı indir → BytesIO ile oku
+    r = requests.get(URL_RISK, timeout=30)
+    r.raise_for_status()
+    df = pd.read_parquet(io.BytesIO(r.content))
+
     # kolonları normalize et
     df.columns = [c.strip().lower() for c in df.columns]
 
@@ -37,26 +42,25 @@ def load_risk() -> pd.DataFrame:
             if alt in df.columns:
                 df["geoid"] = df[alt]
                 break
-    df["geoid"] = _norm_geoid(df["geoid"])
+    df["geoid"] = (
+        df["geoid"].astype(str)
+        .str.replace(r"\D", "", regex=True)
+        .str.zfill(11)
+        .str[:11]
+    )
 
-    # proba/risk_score alias — 0/1 kolonları ele
+    # proba/risk_score alias — 0/1 kolonlarını ele
     prob_candidates = [c for c in ["proba", "risk_score", "score", "p", "prob"] if c in df.columns]
     risk_col = None
     for c in prob_candidates:
         s = pd.to_numeric(df[c], errors="coerce")
-        uniq = set(s.dropna().unique())
-        if not uniq.issubset({0.0, 1.0}):  # ikili ise olasılık değildir
+        if not set(s.dropna().unique()).issubset({0.0, 1.0}):
             risk_col = c
             break
     if risk_col is None:
-        # son çare: varsa proba, yoksa sıfırla
         risk_col = "proba" if "proba" in df.columns else None
-    if risk_col is None:
-        df["risk_score"] = 0.0
-    else:
-        df["risk_score"] = pd.to_numeric(df[risk_col], errors="coerce").fillna(0.0)
+    df["risk_score"] = pd.to_numeric(df.get(risk_col, 0.0), errors="coerce").fillna(0.0)
 
-    # tarih alanı varsa
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"]).dt.date
 
@@ -64,12 +68,19 @@ def load_risk() -> pd.DataFrame:
 
 @st.cache_data(ttl=24 * 60 * 60)
 def load_geojson() -> dict:
-    with urlopen(URL_GEO) as f:
-        gj = json.load(f)
+    r = requests.get(URL_GEO, timeout=30)
+    r.raise_for_status()
+    gj = r.json()
     for ft in gj.get("features", []):
         props = ft.get("properties", {})
-        # normalize et ve properties'te tut
-        props["GEOID"] = _norm_geoid(pd.Series([props.get("GEOID", props.get("geoid", ""))])).iloc[0]
+        val = props.get("GEOID", props.get("geoid", ""))
+        props["GEOID"] = (
+            str(val)
+            .replace("-", "")
+            .replace(" ", "")
+        )
+        props["GEOID"] = props["GEOID"].strip()
+        props["GEOID"] = props["GEOID"][:11].rjust(11, "0")
         ft["properties"] = props
     return gj
 
