@@ -342,119 +342,34 @@ with tabs[0]:
     else:
         st.info("Artifact içinde tarih bulunamadı. Forecast sekmesinden saatlik görünüme bakabilirsiniz.")
 
-# ---------- Forecast ----------
-with tabs[1]:
-    st.subheader("Saatlik Risk & E[olay] (Forecast)")
+st.title("🗺️ Suç Tahmini Uygulaması")
+
+# Sadece 4 sekme: Home, Planning, Stats, Reports
+tabs = st.tabs(["Home", "Planning", "Stats", "Reports"])
+
+# ---------- Home ----------
+with tabs[0]:
+    st.subheader("Suç Risk Haritası — Günlük Ortalama")
+    # (Senin mevcut Home akışı burada aynen dursun)
+    # ...
+    st.info("Saatlik tahmin ve E[olay] için Forecast sayfasını kullanın.")
+    # Streamlit 1.35+ ise:
     try:
-        risk_df = read_risk_from_artifact()
-    except Exception as e:
-        st.error(f"Artifact okunamadı: {e}")
-        st.stop()
+        st.page_link("pages/Forecast.py", label="→ Forecast sayfasına git", icon="🧭")
+    except Exception:
+        pass
 
-    # Saat / gün / sezon seçiciler
-    hours = sorted(risk_df.get("event_hour", pd.Series(range(24))).dropna().unique().tolist())
-    dows  = sorted(risk_df.get("day_of_week", pd.Series([0,1,2,3,4,5,6])).unique().tolist())
-    seasons = sorted(risk_df.get("season", pd.Series(["Winter","Spring","Summer","Fall"])).unique().tolist())
-
-    c1,c2,c3 = st.columns(3)
-    sel_hour   = c1.select_slider("Saat", options=hours, value=hours[0] if hours else 0)
-    sel_dow    = c2.selectbox("Haftanın Günü (0=Mon ... 6=Sun)", options=dows, index=0)
-    sel_season = c3.selectbox("Sezon", options=seasons, index=0)
-
-    # Filtre
-    layer_df = risk_df.copy()
-    if "event_hour" in layer_df.columns: layer_df = layer_df[layer_df["event_hour"]==sel_hour]
-    if "day_of_week" in layer_df.columns: layer_df = layer_df[layer_df["day_of_week"]==sel_dow]
-    if "season" in layer_df.columns:      layer_df = layer_df[layer_df["season"]==sel_season]
-
-# --- risk_score alias (garanti)
-if "risk_score" not in layer_df.columns:
-    if "proba" in layer_df.columns:
-        layer_df["risk_score"] = layer_df["proba"].astype(float)
-    elif "risk" in layer_df.columns:
-        layer_df["risk_score"] = layer_df["risk"].astype(float)
-    else:
-        st.warning("risk_score/proba/risk kolonu bulunamadı.")
-        layer_df["risk_score"] = 0.0
-
-# --- GEOID anahtarını tek tipe indir (lowercase 'geoid' + 11 hane)
-if "geoid" not in layer_df.columns:
-    for alt in ["GEOID", "cell_id", "geoid10", "geoid11", "geoid_10", "geoid_11", "id"]:
-        if alt in layer_df.columns:
-            layer_df["geoid"] = layer_df[alt]
-            break
-layer_df["geoid"] = (
-    layer_df["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
-)
-
-# --- E[olay] = pred_expected (varsa) ELSE risk_score × exposure_guess
-if "pred_expected" not in layer_df.columns:
-    exp = load_exposure_fallback()  # beklenen: GEOID/geoid, hour_range?, exposure_guess
-
-    # exposure tarafını da 'geoid' standardına çek
-    if not exp.empty:
-        if "GEOID" in exp.columns:
-            exp = exp.rename(columns={"GEOID": "geoid"})
-        exp["geoid"] = exp["geoid"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
-
-    if (not exp.empty) and ("hour_range" in layer_df.columns) and ("hour_range" in exp.columns):
-        layer_df = layer_df.merge(
-            exp[["geoid", "hour_range", "exposure_guess"]],
-            on=["geoid", "hour_range"], how="left"
-        )
-    else:
-        exp_geo = (
-            exp.groupby("geoid", as_index=False)["exposure_guess"].mean()
-            if not exp.empty else pd.DataFrame(columns=["geoid", "exposure_guess"])
-        )
-        layer_df = layer_df.merge(exp_geo, on="geoid", how="left")
-
-    layer_df["exposure_guess"] = layer_df["exposure_guess"].fillna(0.3)
-    layer_df["pred_expected"]  = (layer_df["risk_score"] * layer_df["exposure_guess"]).round(2)
-
-# --- GeoJSON
-geojson = fetch_geojson_smart(
-    path_local=GEOJSON_PATH_LOCAL_DEFAULT,
-    path_in_zip=GEOJSON_IN_ZIP_PATH_DEFAULT,
-    raw_owner=RAW_GEOJSON_OWNER,
-    raw_repo=RAW_GEOJSON_REPO,
-)
-
-# --- Harita + Top-K
-colL, colR = st.columns([3, 1], gap="large")
-with colL:
-    if geojson and not layer_df.empty:
-        # make_map_forecast 'geoid' bekliyor; tüm kolonları UPPER yapma
-        make_map_forecast(geojson, layer_df)
-    else:
-        st.info("GeoJSON veya katman verisi yok.")
-
-with colR:
-    st.markdown("**Kritik Top-K (E[olay])**")
-    topn = st.slider("Kayıt sayısı", 10, 200, 50)
-    cols_show = [c for c in ["geoid", "risk_score", "pred_expected"] if c in layer_df.columns]
-    top = (
-        layer_df[cols_show]
-        .sort_values(["pred_expected", "risk_score"], ascending=False)
-        .head(topn)
-        .reset_index(drop=True)
-    )
-    st.dataframe(top, use_container_width=True)
-    if not layer_df.empty:
-        q25, q50, q75 = layer_df["risk_score"].quantile([.25, .5, .75]).round(4)
-        st.caption(f"Q25={q25:.4f} • Q50={q50:.4f} • Q75={q75:.4f}")
-        
 # ---------- Planning ----------
-with tabs[2]:
+with tabs[1]:
     st.subheader("🚓 Devriye Planlama (yakında)")
-    st.info("Mevcut öneri motorunu buraya bağlayacağız: ekip sayısı, rota uzunluğu, dwell, çeşitlilik ayarı vs.")
+    st.info("Ekip sayısı / rota uzunluğu / dwell / çeşitlilik ayarı buraya taşınacak.")
 
 # ---------- Stats ----------
-with tabs[3]:
+with tabs[2]:
     st.subheader("📊 Suç İstatistikleri (yakında)")
-    st.info("Saat/gün/ay dağılımları, gün×saat ısı haritası, tür dağılımları ve seçili GEOID detayları eklenecek.")
+    st.info("Saat-gün-ay dağılımları, ısı haritaları, tür dağılımı vs.")
 
 # ---------- Reports ----------
-with tabs[4]:
+with tabs[3]:
     st.subheader("🧾 Raporlar & Operasyonel Öneriler (yakında)")
-    st.info("Günlük/Haftalık/Aylık rapor üretimi + PDF/CSV indir düğmeleri burada olacak.")
+    st.info("Günlük/Haftalık/Aylık rapor üretimi + PDF/CSV indirme burada.")
