@@ -16,6 +16,26 @@ import folium
 from streamlit_folium import st_folium
 from folium.plugins import HeatMap
 
+import numpy as np
+
+def sanitize_props(geojson_dict: dict) -> dict:
+    """GeoJSON properties içindeki NaN / numpy tipleri / Timestamp'leri JSON uyumlu hale getirir."""
+    def _fix(v):
+        if pd.isna(v):
+            return ""
+        if isinstance(v, (np.generic, np.bool_)):   # np.int64, np.float32, np.bool_ -> native
+            return v.item()
+        if isinstance(v, pd.Timestamp):
+            return v.isoformat()
+        return v
+
+    feats = geojson_dict.get("features", [])
+    for i in range(len(feats)):
+        props = feats[i].get("properties") or {}
+        feats[i]["properties"] = {k: _fix(v) for k, v in props.items()}
+    geojson_dict["features"] = feats
+    return geojson_dict
+
 # =========================
 # Sabitler
 # =========================
@@ -323,6 +343,7 @@ def make_priority_color(priority: str) -> str:
     return cmap.get(priority, "#CCCCCC")
 
 def render_map(geojson: dict, slice_df: pd.DataFrame, value_col: str = "pred_expected") -> Tuple[folium.Map, Dict[str, Tuple[float,float]]]:
+    geojson = sanitize_props(geojson) 
     # merkez SF
     m = folium.Map(location=[37.7749, -122.4194], zoom_start=12, tiles="cartodbpositron")
     # Heatmap: centroids + intensity
@@ -461,7 +482,7 @@ mres = st_folium(folium_map, width=None, height=600, use_container_width=True)
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Kapsam (GEOID)", f"{sl['geoid'].nunique()}")
 c2.metric("Medyan E[olay]", f"{sl['pred_expected'].median():.2f}")
-c3.metric("Q75", f"{sl['q75'].iloc[0]:.2f}")
+c3.metric("Q75", f"{sl['pred_expected'].quantile(0.75):.2f}")
 c4.metric("Toplam E[olay]", f"{sl['pred_expected'].sum():.2f}")
 
 # Top-K tablo
