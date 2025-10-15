@@ -316,32 +316,15 @@ with tabs[0]:
         raw_owner=RAW_GEOJSON_OWNER,
         raw_repo=RAW_GEOJSON_REPO,
     )
-
+    
     if sel_date:
         one_day = classify_quantiles(risk_daily, sel_date)
         if not one_day.empty:
-            q25 = float(one_day["q25"].iloc[0])
-            q50 = float(one_day["q50"].iloc[0])
-            q75 = float(one_day["q75"].iloc[0])
-    
-            mode = st.segmented_control(
-                "Özet görünüm",
-                options=["Basit", "Detaylı"],
-                default="Detaylı",
-                help="İstersen sadece şehir ortalamasını göster."
-            )
-    
-            if mode == "Detaylı":
-                c1, c2, c3 = st.columns(3)
-                c1.metric("🟢 Güvenli Bölgeler Ortalaması", f"{q25:.4f}",
-                          help="En düşük riskli %25'lik dilimin ortalaması (eski: Q25)")
-                c2.metric("🟡 Şehir Geneli Ortalama Risk", f"{q50:.4f}",
-                          help="Tüm bölgelerin medyan riski (eski: Q50)")
-                c3.metric("🔴 Riskli Bölgeler Ortalaması", f"{q75:.4f}",
-                          help="En yüksek riskli %25'lik dilimin ortalaması (eski: Q75)")
-            else:
-                st.metric("Şehir Geneli Ortalama Risk", f"{q50:.4f}",
-                          help="Basit görünüm: medyan risk")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Q25", f"{one_day['q25'].iloc[0]:.4f}")
+            c2.metric("Q50", f"{one_day['q50'].iloc[0]:.4f}")
+            c3.metric("Q75", f"{one_day['q75'].iloc[0]:.4f}")
+
         st.subheader(f"Harita — {sel_date}")
         enriched = inject_properties(geojson, one_day) if (geojson and not one_day.empty) else geojson
         if not geojson:
