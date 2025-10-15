@@ -20,7 +20,7 @@ GEOJSON_IN_ZIP_PATH_DEFAULT = "data/sf_cells.geojson"
 RAW_GEOJSON_OWNER = "cem5113"
 RAW_GEOJSON_REPO  = "crimepredict"
 
-RAW_C09 = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/crime_prediction_data/sf_crime_09.csv"
+RAW_C09 = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/sf_crime_09.csv"
 
 GITHUB_TOKEN = st.secrets.get("github_token", os.environ.get("GITHUB_TOKEN", ""))
 
