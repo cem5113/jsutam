@@ -1,5 +1,14 @@
 # pages/Forecast.py
 # Çok-ufuklu tahmin + (Hepsi veya suç türü) + Top-3 suç özeti
+try:
+    import sklearn  # noqa
+except Exception as e:
+    import streamlit as st
+    st.error("Gerekli paketler yüklü değil: scikit-learn (ve bağımlılıkları). "
+             "Lütfen requirements.txt dosyasını repo köküne ekleyin/güncelleyin ve uygulamayı yeniden başlatın.")
+    st.code("pip install -r requirements.txt", language="bash")
+    st.stop()
+
 import io, os, zipfile
 from datetime import datetime
 import pandas as pd
