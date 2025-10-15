@@ -13,7 +13,6 @@ OWNER = "cem5113"
 REPO = "crime_prediction_data"
 ARTIFACT_NAME = "sf-crime-parquet"
 EXPECTED_PARQUET = "risk_hourly.parquet"
-EXPECTED_C09 = "sf_crime_09.parquet"
 
 GEOJSON_PATH_LOCAL_DEFAULT = "data/sf_cells.geojson"
 GEOJSON_IN_ZIP_PATH_DEFAULT = "data/sf_cells.geojson"
@@ -21,7 +20,20 @@ GEOJSON_IN_ZIP_PATH_DEFAULT = "data/sf_cells.geojson"
 RAW_GEOJSON_OWNER = "cem5113"
 RAW_GEOJSON_REPO  = "crimepredict"
 
-RAW_C09 = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/sf_crime_09.parquet"
+C09_CANDIDATES = [
+    "sf_crime_09.parquet",
+    "crime_prediction_data/sf_crime_09.parquet",
+    "sf_crime_09.parquet.gzip",
+    "sf_crime_09.csv",
+    "crime_prediction_data/sf_crime_09.csv",
+]
+
+RAW_C09_URLS = [
+    f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/sf_crime_09.parquet",
+    f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/crime_prediction_data/sf_crime_09.parquet",
+    f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/sf_crime_09.parquet.gzip",
+    f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/sf_crime_09.csv",
+    f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/crime_prediction_data/sf_crime_09.csv",
 
 GITHUB_TOKEN = st.secrets.get("github_token", os.environ.get("GITHUB_TOKEN", ""))
 
@@ -165,43 +177,50 @@ def fetch_geojson_smart(path_local: str, path_in_zip: str, raw_owner: str, raw_r
 
 @st.cache_data(show_spinner=True, ttl=15*60)
 def read_c09_from_artifact() -> pd.DataFrame:
-    """
-    Aynı artifact ZIP içinden sf_crime_09.parquet'yi bulup okur.
-    """
     zip_bytes = fetch_latest_artifact_zip(OWNER, REPO, ARTIFACT_NAME)
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         memlist = zf.namelist()
-        # hem kökte hem klasör içinde olabilir: endswith ile ara
-        candidates = [n for n in memlist if n.endswith("/" + EXPECTED_C09) or n.endswith(EXPECTED_C09)]
-        if not candidates:
-            raise FileNotFoundError(f"Zip içinde {EXPECTED_C09} yok. Örnek içerik: {memlist[:12]}")
-        with zf.open(candidates[0]) as f:
-            c9 = pd.read_parquet(f)
+        # Adayların herhangi birine uyan ilkini al
+        cand = None
+        for c in C09_CANDIDATES:
+            hit = [n for n in memlist if n.endswith("/" + c) or n.endswith(c)]
+            if hit:
+                cand = hit[0]
+                break
+        if cand is None:
+            # Teşhis için ilk 20 dosyayı gösterin
+            raise FileNotFoundError(f"Zip içinde sf_crime_09 bulunamadı. Örnek içerik: {memlist[:20]}")
 
-    # kolon adlarını normalize et
-    cols_l = {c: c.strip() for c in c9.columns}
-    c9 = c9.rename(columns=cols_l)
+        with zf.open(cand) as f:
+            if cand.lower().endswith(".csv"):
+                c9 = pd.read_csv(f)
+            else:
+                c9 = pd.read_parquet(f)
 
-    # GEOID normalize
-    geoid_col = "GEOID" if "GEOID" in c9.columns else ("geoid" if "geoid" in c9.columns else None)
-    if geoid_col is None:
-        # çıplak döndür; exposure üretirken boş gelecek (ileride fallback var)
-        return c9
+    # Kolon normalizasyonu
+    c9.columns = [c.strip() for c in c9.columns]
+    if "geoid" not in c9.columns:
+        if "GEOID" in c9.columns:
+            c9["geoid"] = c9["GEOID"]
+    if "geoid" in c9.columns:
+        c9["geoid"] = (c9["geoid"].astype(str)
+                       .str.replace(r"\D", "", regex=True).str.zfill(11))
 
-    c9["geoid"] = c9[geoid_col].astype(str).str.replace(r"\D", "", regex=True).str.zfill(11)
-
-    # isim toleransı (dow/event_hour farklı adlarla gelebilir)
+    # Saat/gün/season toleransı
     if "day_of_week" not in c9.columns and "dow" in c9.columns:
         c9 = c9.rename(columns={"dow": "day_of_week"})
     if "event_hour" not in c9.columns and "hour_range" in c9.columns:
         c9["event_hour"] = pd.to_numeric(c9["hour_range"], errors="coerce").fillna(0).astype(int)
+    if "season" not in c9.columns:
+        c9["season"] = "All"
 
-    # exposure tahmini: crime_last_7d / 7
+    # Exposure üret (yoksa)
     if "exposure_guess" not in c9.columns:
-        base = pd.to_numeric(c9.get("crime_last_7d", 0), errors="coerce") / 7.0
+        base = pd.to_numeric(c9.get("crime_last_7d", 0), errors="coerce")/7.0
         c9["exposure_guess"] = base.clip(lower=0.1).fillna(0.1)
 
-    return c9
+    keep = ["geoid","season","day_of_week","event_hour","exposure_guess"]
+    return c9[[k for k in keep if k in c9.columns]].copy()
 
 # -------------------------
 # Exposure fallback (sf_crime_09.parquet)
@@ -209,44 +228,39 @@ def read_c09_from_artifact() -> pd.DataFrame:
 @st.cache_data(ttl=30*60, show_spinner=False)
 @st.cache_data(ttl=30*60, show_spinner=False)
 def load_exposure_fallback() -> pd.DataFrame:
-    """
-    Önce artifact ZIP içinden sf_crime_09.parquet'yi okumayı dener.
-    Olmazsa (isteğe bağlı) RAW_C09 URL'ine düşer.
-    Çıktı: ['geoid','season','day_of_week','event_hour','exposure_guess']
-    """
-    # 1) Artifact'tan dene
+    # 1) Artifact
     try:
         c9 = read_c09_from_artifact()
     except Exception:
         c9 = pd.DataFrame()
 
-    # 2) Artifact boşsa (opsiyonel) RAW URL dene
-    if c9.empty and 'RAW_C09' in globals() and RAW_C09:
-        try:
-            r = requests.get(RAW_C09, timeout=20)
-            if r.status_code == 200:
-                import io as _io
-                c9 = pd.read_parquet(_io.BytesIO(r.content))
-        except Exception:
-            pass
+    # 2) RAW denemeleri
+    if c9.empty:
+        for u in RAW_C09_URLS:
+            try:
+                r = requests.get(u, timeout=25)
+                if r.status_code == 200:
+                    import io as _io
+                    if u.lower().endswith(".csv"):
+                        c9 = pd.read_csv(_io.BytesIO(r.content))
+                    else:
+                        c9 = pd.read_parquet(_io.BytesIO(r.content))
+                    break
+            except Exception:
+                pass
 
     if c9.empty:
         return pd.DataFrame(columns=["geoid","season","day_of_week","event_hour","exposure_guess"])
 
-    # normalize alanlar
-    if "geoid" not in c9.columns:
-        if "GEOID" in c9.columns:
-            c9["geoid"] = c9["GEOID"]
-        else:
-            return pd.DataFrame(columns=["geoid","season","day_of_week","event_hour","exposure_guess"])
-
+    # Normalizasyon (gerekirse)
+    if "geoid" not in c9.columns and "GEOID" in c9.columns:
+        c9["geoid"] = c9["GEOID"]
     c9["geoid"] = c9["geoid"].astype(str).str.replace(r"\D","",regex=True).str.zfill(11)
     c9["season"] = c9.get("season", "All").astype(str)
     c9["day_of_week"] = pd.to_numeric(c9.get("day_of_week", 0), errors="coerce").fillna(0).astype(int)
     c9["event_hour"]  = pd.to_numeric(c9.get("event_hour", 0),  errors="coerce").fillna(0).astype(int)
-
     if "exposure_guess" not in c9.columns:
-        base = pd.to_numeric(c9.get("crime_last_7d", 0), errors="coerce") / 7.0
+        base = pd.to_numeric(c9.get("crime_last_7d", 0), errors="coerce")/7.0
         c9["exposure_guess"] = base.clip(lower=0.1).fillna(0.1)
 
     keep = ["geoid","season","day_of_week","event_hour","exposure_guess"]
@@ -342,17 +356,6 @@ def attach_pred_expected(df: pd.DataFrame) -> pd.DataFrame:
     # sonuç
     m["pred_expected"] = (pd.to_numeric(m["risk_score"], errors="coerce").fillna(0.0) *
                           pd.to_numeric(m["exposure_guess"], errors="coerce").fillna(0.3)).round(3)
-
-    if "day_of_week" not in c9.columns and "dow" in c9.columns:
-        c9 = c9.rename(columns={"dow": "day_of_week"})
-    if "event_hour" not in c9.columns and "hour_range" in c9.columns:
-        c9["event_hour"] = pd.to_numeric(c9["hour_range"], errors="coerce").fillna(0).astype(int)
-    
-    need_cols = {"geoid","season","day_of_week","event_hour","exposure_guess"}
-    missing = need_cols - set(c9.columns)
-    if missing:
-        st.warning(f"sf_crime_09 eksik kolon(lar): {', '.join(sorted(missing))}")
-        
     return m
     
 # -------------------------
@@ -500,7 +503,6 @@ with st.sidebar:
             return max(0, seasons.index(m2s[mo]))
         except Exception:
             return 0
-    season = st.selectbox("Sezon", seasons, index=_idx_default())
     topk = st.slider("Top-K (kritik liste)", 10, 200, 50)
 
 # seçime göre veri
@@ -569,7 +571,13 @@ if sel.empty:
 else:
     top_df = sel.nlargest(topk, columns=["pred_expected"])[["geoid","risk_score","pred_expected"]]
     st.dataframe(top_df.reset_index(drop=True), use_container_width=True)
-    parquet = top_df.to_patquet(index=False).encode("utf-8")
+    parquet_bytes = top_df.to_parquet(index=False)
+    st.download_button(
+        "Top-K PARQUET indir",
+        parquet_bytes,
+        file_name=f"forecast_topk_h{hour}_d{dow}_{season}.parquet",
+        mime="application/octet-stream"
+    )
     st.download_button("Top-K PARQUET indir", parquet, file_name=f"forecast_topk_h{hour}_d{dow}_{season}.parquet", mime="text/parquet")
 
 # Alt notlar
