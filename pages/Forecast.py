@@ -15,6 +15,7 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 from folium.plugins import HeatMap
+import requests  # << eklendi
 
 # ====== dorecast API ======
 try:
@@ -95,7 +96,6 @@ def fetch_geojson_smart(path_local: str, path_in_zip: str, raw_owner: str, raw_r
     # 3) Raw GitHub
     try:
         raw = f"https://raw.githubusercontent.com/{raw_owner}/{raw_repo}/main/{path_local}"
-        import requests
         r = requests.get(raw, timeout=30)
         if r.status_code == 200:
             return r.json()
@@ -256,7 +256,7 @@ with st.sidebar:
             if any(b in base for b in bad):
                 continue
             return n
-        # 3) En sona kalırsa yine de ilkini döndür (ama muhtemelen işe yaramaz)
+        # 3) En sona kalırsa yine de ilkini döndür
         return names[0] if names else ""
     
     zip_bytes = st.session_state.get("_art_zip")
@@ -304,8 +304,11 @@ def read_history_from_artifact(parquet_in_zip: str) -> pd.DataFrame:
 def normalize_history(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
+    # --- tekrarlı sütun adlarını temizle (parquet bazen duplicate getirir) ---
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()]
+
     # ---- datetime ----
-    # 1) doğrudan datetime/timestamp varsa onu kullan
     dtcol = None
     for c in df.columns:
         lc = c.lower()
@@ -314,59 +317,41 @@ def normalize_history(df: pd.DataFrame) -> pd.DataFrame:
 
     if dtcol is not None:
         df.rename(columns={dtcol:"datetime"}, inplace=True)
-        df["datetime"] = pd.to_datetime(df["datetime"])
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     else:
-        # 2) date + hour veya hour_from +/− hour_range'den üret
-        # date
-        dcol = None
-        for c in df.columns:
-            if c.lower() == "date":
-                dcol = c; break
+        # 2) date + hour / hour_from / hour_range -> güvenli string birleştirme
+        dcol = next((c for c in df.columns if c.lower()=="date"), None)
         if dcol is None:
             raise ValueError("datetime türetilemedi: 'date' veya 'datetime' bulunamadı.")
 
-        df["__date"] = pd.to_datetime(df[dcol]).dt.date
-
-        # hour
-        hcol = None
-        for c in df.columns:
-            if c.lower() == "hour":
-                hcol = c; break
+        hcol = next((c for c in df.columns if c.lower()=="hour"), None)
+        hfcol = next((c for c in df.columns if c.lower() in ["hour_from","hourstart"]), None)
+        hrcol = next((c for c in df.columns if c.lower() in ["hour_range","hourrange"]), None)
 
         if hcol is not None:
-            hh = pd.to_numeric(df[hcol], errors="coerce").fillna(0).astype(int).clip(0,23)
+            hh = pd.to_numeric(df[hcol], errors="coerce")
+        elif hfcol is not None:
+            hh = pd.to_numeric(df[hfcol], errors="coerce")
+        elif hrcol is not None:
+            hh = df[hrcol].astype(str).str.extract(r"(\d{1,2})")[0].astype(float)
         else:
-            # hour_from ya da hour_range ("18-20") → başlangıç saati
-            hf = None
-            for c in df.columns:
-                if c.lower() in ["hour_from","hourstart","hourrange","hour_range"]:
-                    hf = c; break
-            if hf is not None:
-                if hf.lower() in ["hour_range","hourrange"]:
-                    hh = df[hf].astype(str).str.extract(r"(\d{1,2})")[0].astype(float).fillna(0).astype(int).clip(0,23)
-                else:
-                    hh = pd.to_numeric(df[hf], errors="coerce").fillna(0).astype(int).clip(0,23)
-            else:
-                raise ValueError("datetime türetilemedi: 'hour' / 'hour_range' yok.")
+            raise ValueError("datetime türetilemedi: 'hour'/'hour_from'/'hour_range' yok.")
 
-        df["datetime"] = pd.to_datetime(df["__date"]) + pd.to_timedelta(hh, unit="h")
-        df.drop(columns=["__date"], inplace=True)
+        hh = hh.fillna(0).astype(int).clip(0,23)
+        dser = pd.to_datetime(df[dcol], errors="coerce")
+        dstr = dser.dt.strftime("%Y-%m-%d")
+        df["datetime"] = pd.to_datetime(dstr + " " + hh.astype(str).str.zfill(2) + ":00:00", errors="coerce")
 
     # ---- GEOID ----
-    gcol = None
-    for c in df.columns:
-        if c.lower() in ["geoid","cell_id","geoid10","geoid11","geoid_10","geoid_11","id"]:
-            gcol = c; break
+    gcol = next((c for c in df.columns if c.lower() in ["geoid","cell_id","geoid10","geoid11","geoid_10","geoid_11","id"]), None)
     if gcol is None:
         raise ValueError("GEOID sütunu bulunamadı.")
-    df.rename(columns={gcol:"GEOID"}, inplace=True)
+    if gcol != "GEOID":
+        df.rename(columns={gcol:"GEOID"}, inplace=True)
     df["GEOID"] = df["GEOID"].astype(str).str.replace(r"\D","",regex=True).str.zfill(11)
 
     # ---- Y_label ----
-    ycol = None
-    for c in df.columns:
-        if c in ["Y_label","y_label","label","y","target"]:
-            ycol = c; break
+    ycol = next((c for c in df.columns if c in ["Y_label","y_label","label","y","target"]), None)
     if ycol is None:
         raise ValueError("Y_label (hedef) sütunu bulunamadı (risk/proba dosyaları uygun değil).")
     if ycol != "Y_label":
@@ -376,6 +361,8 @@ def normalize_history(df: pd.DataFrame) -> pd.DataFrame:
     # çıktı
     keep_core = ["datetime","GEOID","Y_label"]
     others = [c for c in df.columns if c not in keep_core]
+    # null datetime'ları at
+    df = df.dropna(subset=["datetime"])
     return df[keep_core + others]
 
 def suggest_top_geoids(hist: pd.DataFrame, t0: pd.Timestamp, k: int = 200) -> List[str]:
